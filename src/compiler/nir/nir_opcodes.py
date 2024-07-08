@@ -199,7 +199,7 @@ def unop_numeric_convert(name, out_type, in_type, const_expr, description = ""):
 
 unop("mov", tuint, "src0")
 
-unop("ineg", tint, "-src0")
+unop("ineg", tint, "src0 == u_intN_min(bit_size) ? src0 : -src0")
 unop("fneg", tfloat, "-src0")
 unop("inot", tint, "~src0", description = "Invert every bit of the integer")
 
@@ -401,7 +401,6 @@ unpack_2x16("snorm")
 unpack_4x8("snorm")
 unpack_2x16("unorm")
 unpack_4x8("unorm")
-unpack_2x16("half")
 
 unop_horiz("pack_uint_2x16", 1, tuint32, 2, tuint32, """
 dst.x = _mesa_unsigned_to_unsigned(src0.x, 16);
@@ -452,22 +451,18 @@ unop_horiz("unpack_32_2x16", 2, tuint16, 1, tuint32,
 unop_horiz("unpack_32_4x8", 4, tuint8, 1, tuint32,
            "dst.x = src0.x; dst.y = src0.x >> 8; dst.z = src0.x >> 16; dst.w = src0.x >> 24;")
 
-unop_horiz("unpack_half_2x16_flush_to_zero", 2, tfloat32, 1, tuint32, """
-dst.x = unpack_half_1x16_flush_to_zero((uint16_t)(src0.x & 0xffff));
-dst.y = unpack_half_1x16_flush_to_zero((uint16_t)(src0.x << 16));
+unop_horiz("unpack_half_2x16", 2, tfloat32, 1, tuint32, """
+dst.x = unpack_half_1x16((uint16_t)(src0.x & 0xffff), nir_is_denorm_flush_to_zero(execution_mode, 16));
+dst.y = unpack_half_1x16((uint16_t)(src0.x >> 16), nir_is_denorm_flush_to_zero(execution_mode, 16));
 """)
 
 # Lowered floating point unpacking operations.
 
 unop_convert("unpack_half_2x16_split_x", tfloat32, tuint32,
-             "unpack_half_1x16((uint16_t)(src0 & 0xffff))")
+             "unpack_half_1x16((uint16_t)(src0 & 0xffff), nir_is_denorm_flush_to_zero(execution_mode, 16))")
 unop_convert("unpack_half_2x16_split_y", tfloat32, tuint32,
-             "unpack_half_1x16((uint16_t)(src0 >> 16))")
+             "unpack_half_1x16((uint16_t)(src0 >> 16), nir_is_denorm_flush_to_zero(execution_mode, 16))")
 
-unop_convert("unpack_half_2x16_split_x_flush_to_zero", tfloat32, tuint32,
-             "unpack_half_1x16_flush_to_zero((uint16_t)(src0 & 0xffff))")
-unop_convert("unpack_half_2x16_split_y_flush_to_zero", tfloat32, tuint32,
-             "unpack_half_1x16_flush_to_zero((uint16_t)(src0 >> 16))")
 
 unop_convert("unpack_32_2x16_split_x", tuint16, tuint32, "src0")
 unop_convert("unpack_32_2x16_split_y", tuint16, tuint32, "src0 >> 16")
@@ -828,8 +823,14 @@ binop("frem", tfloat, "", "src0 - src1 * truncf(src0 / src1)")
 
 binop_compare_all_sizes("flt", tfloat, "", "src0 < src1")
 binop_compare_all_sizes("fge", tfloat, "", "src0 >= src1")
+binop_compare_all_sizes("fltu", tfloat, "", "isnan(src0) || isnan(src1) || src0 < src1")
+binop_compare_all_sizes("fgeu", tfloat, "", "isnan(src0) || isnan(src1) || src0 >= src1")
 binop_compare_all_sizes("feq", tfloat, _2src_commutative, "src0 == src1")
 binop_compare_all_sizes("fneu", tfloat, _2src_commutative, "src0 != src1")
+binop_compare_all_sizes("fequ", tfloat, _2src_commutative, "isnan(src0) || isnan(src1) || src0 == src1")
+binop_compare_all_sizes("fneo", tfloat, _2src_commutative, "!isnan(src0) && !isnan(src1) && src0 != src1")
+binop_compare_all_sizes("funord", tfloat, _2src_commutative, "isnan(src0) || isnan(src1)")
+binop_compare_all_sizes("ford", tfloat, _2src_commutative, "!isnan(src0) && !isnan(src1)")
 binop_compare_all_sizes("ilt", tint, "", "src0 < src1")
 binop_compare_all_sizes("ige", tint, "", "src0 >= src1")
 binop_compare_all_sizes("ieq", tint, _2src_commutative, "src0 == src1")
@@ -936,10 +937,10 @@ binop("umax", tuint, _2src_commutative + associative, "src1 > src0 ? src1 : src0
 binop("fpow", tfloat, "", "bit_size == 64 ? pow(src0, src1) : powf(src0, src1)")
 
 binop_horiz("pack_half_2x16_split", 1, tuint32, 1, tfloat32, 1, tfloat32,
-            "pack_half_1x16(src0.x) | (pack_half_1x16(src1.x) << 16)")
+            "pack_half_1x16(src0.x) | ((uint32_t)(pack_half_1x16(src1.x)) << 16)")
 
 binop_horiz("pack_half_2x16_rtz_split", 1, tuint32, 1, tfloat32, 1, tfloat32,
-            "pack_half_1x16_rtz(src0.x) | (pack_half_1x16_rtz(src1.x) << 16)")
+            "pack_half_1x16_rtz(src0.x) | (uint32_t)(pack_half_1x16_rtz(src1.x) << 16)")
 
 binop_convert("pack_64_2x32_split", tuint64, tuint32, "",
               "src0 | ((uint64_t)src1 << 32)")
@@ -1410,11 +1411,11 @@ for (int i = 0; i < 32; i += 8) {
 """)
 
 # unorm multiply: (a * b) / 255.
-binop("umul_unorm_4x8_vc4", tint32, _2src_commutative + associative, """
+binop("umul_unorm_4x8_vc4", tuint32, _2src_commutative + associative, """
 dst = 0;
 for (int i = 0; i < 32; i += 8) {
-   int src0_chan = (src0 >> i) & 0xff;
-   int src1_chan = (src1 >> i) & 0xff;
+   uint32_t src0_chan = (src0 >> i) & 0xff;
+   uint32_t src1_chan = (src1 >> i) & 0xff;
    dst |= ((src0_chan * src1_chan) / 255) << i;
 }
 """)
@@ -1458,7 +1459,7 @@ opcode("pack_4x16_to_4x8_v3d", 0, tuint32, [0, 0], [tuint32, tuint32],
 unop("pack_2x16_to_unorm_2x8_v3d", tuint32,
      "_mesa_half_to_unorm(src0 & 0xffff, 8) | (_mesa_half_to_unorm(src0 >> 16, 8) << 16)")
 unop("pack_2x16_to_snorm_2x8_v3d", tuint32,
-     "_mesa_half_to_snorm(src0 & 0xffff, 8) | (_mesa_half_to_snorm(src0 >> 16, 8) << 16)")
+     "_mesa_half_to_snorm(src0 & 0xffff, 8) | ((uint32_t)(_mesa_half_to_snorm(src0 >> 16, 8)) << 16)")
 
 # v3d-specific (v71) instructions to convert 32-bit floating point to 16 bit unorm/snorm
 unop("f2unorm_16_v3d", tuint32, "_mesa_float_to_unorm16(src0)")

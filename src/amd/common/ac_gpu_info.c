@@ -895,10 +895,13 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       case FAMILY_GFX1103:
          identify_chip(GFX1103_R1);
          identify_chip(GFX1103_R2);
+         identify_chip2(GFX1103_R1X, GFX1103_R1);
+         identify_chip2(GFX1103_R2X, GFX1103_R2);
          break;
       case FAMILY_GFX1150:
          identify_chip(GFX1150);
          identify_chip(GFX1151);
+         identify_chip(GFX1152);
          break;
       case FAMILY_GFX12:
          identify_chip(GFX1200);
@@ -1221,6 +1224,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->has_dcc_constant_encode =
       info->family == CHIP_RAVEN2 || info->family == CHIP_RENOIR || info->gfx_level >= GFX10;
 
+   /* TC-compat HTILE is only available for GFX8-GFX11.5. */
+   info->has_tc_compatible_htile = info->gfx_level >= GFX8 && info->gfx_level < GFX12;
+
+   info->has_etc_support = info->family == CHIP_STONEY || info->family == CHIP_VEGA10 ||
+                           info->family == CHIP_RAVEN || info->family == CHIP_RAVEN2;
+
    info->has_rbplus = info->family == CHIP_STONEY || info->gfx_level >= GFX9;
 
    /* Some chips have RB+ registers, but don't support RB+. Those must
@@ -1335,6 +1344,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
                                       info->mec_fw_version < 100;
 
    info->has_export_conflict_bug = info->gfx_level == GFX11;
+
+   /* When LLVM is fixed to handle multiparts shaders, this value will depend
+    * on the known good versions of LLVM. Until then, enable the equivalent WA
+    * in the nir -> llvm backend.
+    */
+   info->needs_llvm_wait_wa = info->gfx_level == GFX11;
 
    /* Convert the SDMA version in the current GPU to an enum. */
    info->sdma_ip_version =

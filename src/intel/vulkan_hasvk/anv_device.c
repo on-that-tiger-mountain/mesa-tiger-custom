@@ -232,7 +232,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_multiview                         = true,
       .KHR_performance_query =
          !anv_use_relocations(device) && device->perf &&
-         (device->perf->i915_perf_version >= 3 ||
+         (intel_perf_has_hold_preemption(device->perf) ||
           INTEL_DEBUG(DEBUG_NO_OACONFIG)) &&
          device->use_call_secondary,
       .KHR_pipeline_executable_properties    = true,
@@ -314,6 +314,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_shader_atomic_float               = true,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_module_identifier          = true,
+      .EXT_shader_replicated_composites      = true,
       .EXT_shader_subgroup_ballot            = true,
       .EXT_shader_subgroup_vote              = true,
       .EXT_shader_viewport_index_layer       = true,
@@ -331,7 +332,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .GOOGLE_hlsl_functionality1            = true,
       .GOOGLE_user_type                      = true,
       .INTEL_performance_query               = device->perf &&
-                                               device->perf->i915_perf_version >= 3,
+                                               intel_perf_has_hold_preemption(device->perf),
       .INTEL_shader_integer_functions2       = device->info.ver >= 8,
       .EXT_multi_draw                        = true,
       .NV_compute_shader_derivatives         = true,
@@ -590,6 +591,9 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_EXT_shader_module_identifier */
       .shaderModuleIdentifier = true,
+
+      /* VK_EXT_shader_replicated_composites */
+      .shaderReplicatedComposites = true,
 
       /* VK_KHR_shader_subgroup_uniform_control_flow */
       .shaderSubgroupUniformControlFlow = true,
@@ -1451,12 +1455,12 @@ anv_override_engine_counts(int *gc_count, int *g_count, int *c_count)
    int gc_override = -1;
    int g_override = -1;
    int c_override = -1;
-   char *env = getenv("ANV_QUEUE_OVERRIDE");
+   const char *env_ = os_get_option("ANV_QUEUE_OVERRIDE");
 
-   if (env == NULL)
+   if (env_ == NULL)
       return;
 
-   env = strdup(env);
+   char *env = strdup(env_);
    char *save = NULL;
    char *next = strtok_r(env, ",", &save);
    while (next != NULL) {

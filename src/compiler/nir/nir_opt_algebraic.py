@@ -21,6 +21,7 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 
+import argparse
 from collections import OrderedDict
 import nir_algebraic
 from nir_opcodes import type_sizes
@@ -102,7 +103,57 @@ def lowered_sincos(c):
 def intBitsToFloat(i):
     return struct.unpack('!f', struct.pack('!I', i))[0]
 
+# Takes a pattern as input and returns a list of patterns where each
+# pattern has a different permutation of fneg/fabs(value) as the replacement
+# for the key operands in replacements.
+def add_fabs_fneg(pattern, replacements, commutative = True):
+    def to_list(pattern):
+        return [to_list(i) if isinstance(i, tuple) else i for i in pattern]
+
+    def to_tuple(pattern):
+        return tuple(to_tuple(i) if isinstance(i, list) else i for i in pattern)
+
+    def replace_varible(pattern, search, replace):
+        for i in range(len(pattern)):
+            if pattern[i] == search:
+                pattern[i] = replace
+            elif isinstance(pattern[i], list):
+                replace_varible(pattern[i], search, replace)
+
+    if commutative:
+        perms = itertools.combinations_with_replacement(range(4), len(replacements))
+    else:
+        perms = itertools.product(range(4), repeat=len(replacements))
+
+    result = []
+
+    for perm in perms:
+        curr = to_list(pattern)
+
+        for i, (search, base) in enumerate(replacements.items()):
+            if perm[i] == 0:
+                replace = ['fneg', ['fabs', base]]
+            elif perm[i] == 1:
+                replace = ['fabs', base]
+            elif perm[i] == 2:
+                replace = ['fneg', base]
+            elif perm[i] == 3:
+                replace = base
+
+            replace_varible(curr, search, replace)
+
+        result.append(to_tuple(curr))
+    return result
+
+
 optimizations = [
+   # These will be recreated by late_algebraic if supported.
+   # Lowering here means we don't have to duplicate all other optimization patterns.
+   (('fgeu', a, b), ('inot', ('flt', a, b))),
+   (('fltu', a, b), ('inot', ('fge', a, b))),
+   (('fneo', 0.0, a), ('flt', 0.0, ('fabs', a))),
+   (('fequ', 0.0, a), ('inot', ('flt', 0.0, ('fabs', a)))),
+
 
    (('imul', a, '#b(is_pos_power_of_two)'), ('ishl', a, ('find_lsb', b)), '!options->lower_bitops'),
    (('imul', 'a@8', 0x80), ('ishl', a, 7), '!options->lower_bitops'),
@@ -274,21 +325,21 @@ optimizations = [
 
    # Optimize open-coded fmulz.
    # (b==0.0 ? 0.0 : a) * (a==0.0 ? 0.0 : b) -> fmulz(a, b)
-   (('fmul@32(nsz)', ('bcsel', ignore_exact('feq', b, 0.0), 0.0, a), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, b)),
-    ('fmulz', a, b), has_fmulz),
-   (('fmul@32(nsz)', a, ('bcsel', ignore_exact('feq', a, 0.0), 0.0, '#b(is_not_const_zero)')),
-    ('fmulz', a, b), has_fmulz),
+   *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ignore_exact('feq', b, 0.0), 0.0, 'ma'), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, 'mb')),
+    ('fmulz', 'ma', 'mb'), has_fmulz), {'ma' : a, 'mb' : b}),
+   *add_fabs_fneg((('fmul@32(nsz)', 'ma', ('bcsel', ignore_exact('feq', a, 0.0), 0.0, '#b(is_not_const_zero)')),
+    ('fmulz', 'ma', b), has_fmulz), {'ma' : a}),
 
    # ffma(b==0.0 ? 0.0 : a, a==0.0 ? 0.0 : b, c) -> ffmaz(a, b, c)
-   (('ffma@32(nsz)', ('bcsel', ignore_exact('feq', b, 0.0), 0.0, a), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, b), c),
-    ('ffmaz', a, b, c), has_fmulz),
-   (('ffma@32(nsz)', a, ('bcsel', ignore_exact('feq', a, 0.0), 0.0, '#b(is_not_const_zero)'), c),
-    ('ffmaz', a, b, c), has_fmulz),
+   *add_fabs_fneg((('ffma@32(nsz)', ('bcsel', ignore_exact('feq', b, 0.0), 0.0, 'ma'), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, 'mb'), c),
+    ('ffmaz', 'ma', 'mb', c), has_fmulz), {'ma' : a, 'mb' : b}),
+   *add_fabs_fneg((('ffma@32(nsz)', 'ma', ('bcsel', ignore_exact('feq', a, 0.0), 0.0, '#b(is_not_const_zero)'), c),
+    ('ffmaz', 'ma', b, c), has_fmulz), {'ma' : a}),
 
    # b == 0.0 ? 1.0 : fexp2(fmul(a, b)) -> fexp2(fmulz(a, b))
-   (('bcsel(nsz,nnan,ninf)', ignore_exact('feq', b, 0.0), 1.0, ('fexp2', ('fmul@32', a, b))),
-    ('fexp2', ('fmulz', a, b)),
-    has_fmulz),
+   *add_fabs_fneg((('bcsel(nsz,nnan,ninf)', ignore_exact('feq', b, 0.0), 1.0, ('fexp2', ('fmul@32', a, 'mb'))),
+    ('fexp2', ('fmulz', a, 'mb')),
+    has_fmulz), {'mb': b}),
 ]
 
 # Shorthand for the expansion of just the dot product part of the [iu]dp4a
@@ -559,17 +610,27 @@ optimizations.extend([
    (('fge', ('fneg', a), ('fneg', b)), ('fge', b, a)),
    (('feq', ('fneg', a), ('fneg', b)), ('feq', b, a)),
    (('fneu', ('fneg', a), ('fneg', b)), ('fneu', b, a)),
-   (('flt', ('fneg', a), -1.0), ('flt', 1.0, a)),
-   (('flt', -1.0, ('fneg', a)), ('flt', a, 1.0)),
-   (('fge', ('fneg', a), -1.0), ('fge', 1.0, a)),
-   (('fge', -1.0, ('fneg', a)), ('fge', a, 1.0)),
-   (('fneu', ('fneg', a), -1.0), ('fneu', 1.0, a)),
-   (('feq', -1.0, ('fneg', a)), ('feq', a, 1.0)),
+   (('flt', ('fneg', 'a(is_not_const)'), '#b'), ('flt', ('fneg', b), a)),
+   (('flt', '#b', ('fneg', 'a(is_not_const)')), ('flt', a, ('fneg', b))),
+   (('fge', ('fneg', 'a(is_not_const)'), '#b'), ('fge', ('fneg', b), a)),
+   (('fge', '#b', ('fneg', 'a(is_not_const)')), ('fge', a, ('fneg', b))),
+   (('fneu', ('fneg', 'a(is_not_const)'), '#b'), ('fneu', ('fneg', b), a)),
+   (('feq', '#b', ('fneg', 'a(is_not_const)')), ('feq', a, ('fneg', b))),
+   (('flt', a, '#b(is_negative_zero)'), ('flt', a, 0.0)),
+   (('flt', '#b(is_negative_zero)', a), ('flt', 0.0, a)),
+   (('fge', a, '#b(is_negative_zero)'), ('fge', a, 0.0)),
+   (('fge', '#b(is_negative_zero)', a), ('fge', 0.0, a)),
+   (('fneu', a, '#b(is_negative_zero)'), ('fneu', 0.0, a)),
+   (('feq', '#b(is_negative_zero)', a), ('feq', a, 0.0)),
 
    (('ieq', ('ineg', a), 0),  ('ieq', a, 0)),
    (('ine', ('ineg', a), 0),  ('ine', a, 0)),
    (('ieq', ('iabs', a), 0),  ('ieq', a, 0)),
    (('ine', ('iabs', a), 0),  ('ine', a, 0)),
+   (('fneu', ('fabs', a), 0.0), ('fneu', a, 0.0)),
+   (('feq', ('fabs', a), 0.0), ('feq', a, 0.0)),
+   (('fneu', ('fabs', a), ('fabs', a)), ('fneu', a, a)),
+   (('feq', ('fabs', a), ('fabs', a)), ('feq', a, a)),
 
    # b < fsat(NaN) -> b < 0 -> false, and b < Nan -> false.
    (('flt', '#b(is_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('flt', b, a)),
@@ -2240,7 +2301,12 @@ optimizations.extend([
     (('pack_unorm_4x8', 'v'),
      ('pack_uvec4_to_uint',
         ('f2u32', ('fround_even', ('fmul', ('fsat', 'v'), 255.0)))),
-     'options->lower_pack_unorm_4x8'),
+     'options->lower_pack_unorm_4x8 && !options->has_pack_32_4x8'),
+
+    (('pack_unorm_4x8', 'v'),
+     ('pack_32_4x8',
+        ('f2u8', ('fround_even', ('fmul', ('fsat', 'v'), 255.0)))),
+     'options->lower_pack_unorm_4x8 && options->has_pack_32_4x8'),
 
     (('pack_snorm_2x16', 'v'),
      ('pack_uvec2_to_uint',
@@ -2250,7 +2316,12 @@ optimizations.extend([
     (('pack_snorm_4x8', 'v'),
      ('pack_uvec4_to_uint',
         ('f2i32', ('fround_even', ('fmul', ('fmin', 1.0, ('fmax', -1.0, 'v')), 127.0)))),
-     'options->lower_pack_snorm_4x8'),
+     'options->lower_pack_snorm_4x8 && !options->has_pack_32_4x8'),
+
+    (('pack_snorm_4x8', 'v'),
+     ('pack_32_4x8',
+        ('f2i8', ('fround_even', ('fmul', ('fmin', 1.0, ('fmax', -1.0, 'v')), 127.0)))),
+     'options->lower_pack_snorm_4x8 && options->has_pack_32_4x8'),
 
     (('unpack_unorm_2x16', 'v'),
      ('fdiv', ('u2f32', ('vec2', ('extract_u16', 'v', 0),
@@ -2286,11 +2357,19 @@ optimizations.extend([
 
    (('unpack_half_2x16_split_x', 'a@32'),
     ('f2f32', ('u2u16', a)),
-    'options->lower_pack_split'),
+    'options->lower_pack_split && !nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
+
+   (('unpack_half_2x16_split_x', 'a@32'),
+    ('f2f32', ('fmul', 1.0, ('u2u16', a))),
+    'options->lower_pack_split && nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
 
    (('unpack_half_2x16_split_y', 'a@32'),
     ('f2f32', ('u2u16', ('ushr', a, 16))),
-    'options->lower_pack_split'),
+    'options->lower_pack_split && !nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
+
+   (('unpack_half_2x16_split_y', 'a@32'),
+    ('f2f32', ('fmul', 1.0, ('u2u16', ('ushr', a, 16)))),
+    'options->lower_pack_split && nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
 
    (('isign', a), ('imin', ('imax', a, -1), 1), 'options->lower_isign'),
    (('imin', ('imax', a, -1), 1), ('isign', a), '!options->lower_isign'),
@@ -3020,13 +3099,47 @@ late_optimizations = [
 
    # This is how SpvOpFOrdNotEqual might be implemented.  Replace it with
    # SpvOpLessOrGreater.
-   (('iand', ('fneu', a, b),   ('iand', ('feq', a, a), ('feq', b, b))), ('ior', ('!flt', a, b), ('!flt', b, a))),
-   (('iand', ('fneu', a, 0.0),          ('feq', a, a)                ), ('!flt', 0.0, ('fabs', a))),
+   *add_fabs_fneg((('iand', ('fneu', 'ma', 'mb'), ('iand', ('feq', a, a), ('feq', b, b))), ('ior', ('!flt', 'ma', 'mb'), ('!flt', 'mb', 'ma'))), {'ma' : a, 'mb' : b}),
+   (('iand', ('fneu', a, 0.0), ('feq', a, a)), ('!flt', 0.0, ('fabs', a))),
 
    # This is how SpvOpFUnordEqual might be implemented.  Replace it with
    # !SpvOpLessOrGreater.
-   (('ior', ('feq', a, b),   ('ior', ('fneu', a, a), ('fneu', b, b))), ('inot', ('ior', ('!flt', a, b), ('!flt', b, a)))),
-   (('ior', ('feq', a, 0.0),         ('fneu', a, a),                ), ('inot', ('!flt', 0.0, ('fabs', a)))),
+   *add_fabs_fneg((('ior', ('feq', 'ma', 'mb'), ('ior', ('fneu', a, a), ('fneu', b, b))), ('inot', ('ior', ('!flt', 'ma', 'mb'), ('!flt', 'mb', 'ma')))), {'ma' : a, 'mb' : b}),
+   (('ior', ('feq', a, 0.0), ('fneu', a, a)), ('inot', ('!flt', 0.0, ('fabs', a)))),
+
+   *add_fabs_fneg((('ior', ('flt', 'ma', 'mb'), ('ior', ('fneu', a, a), ('fneu', b, b))), ('inot', ('fge', 'ma', 'mb'))), {'ma' : a, 'mb' : b}, False),
+   *add_fabs_fneg((('ior', ('fge', 'ma', 'mb'), ('ior', ('fneu', a, a), ('fneu', b, b))), ('inot', ('flt', 'ma', 'mb'))), {'ma' : a, 'mb' : b}, False),
+   *add_fabs_fneg((('ior', ('flt', 'ma', 'b(is_a_number)'), ('fneu', a, a)), ('inot', ('fge', 'ma', b))), {'ma' : a}),
+   *add_fabs_fneg((('ior', ('fge', 'ma', 'b(is_a_number)'), ('fneu', a, a)), ('inot', ('flt', 'ma', b))), {'ma' : a}),
+   *add_fabs_fneg((('ior', ('flt', 'a(is_a_number)', 'mb'), ('fneu', b, b)), ('inot', ('fge', a, 'mb'))), {'mb' : b}),
+   *add_fabs_fneg((('ior', ('fge', 'a(is_a_number)', 'mb'), ('fneu', b, b)), ('inot', ('flt', a, 'mb'))), {'mb' : b}),
+   *add_fabs_fneg((('iand', ('fneu', 'ma', 'b(is_a_number)'), ('feq', a, a)), ('fneo', 'ma', b), 'options->has_fneo_fcmpu'), {'ma' : a}),
+   *add_fabs_fneg((('ior', ('feq', 'ma', 'b(is_a_number)'), ('fneu', a, a)), ('fequ', 'ma', b), 'options->has_fneo_fcmpu'), {'ma' : a}),
+
+   (('ior', ('flt', a, b), ('flt', b, a)), ('fneo', a, b), 'options->has_fneo_fcmpu'),
+   (('flt', 0.0, ('fabs', a)), ('fneo', 0.0, a), 'options->has_fneo_fcmpu'),
+
+
+   # These don't interfere with the previous optimizations which include this
+   # in the search expression, because nir_algebraic_impl visits instructions
+   # in reverse order.
+   (('ior', ('fneu', 'a@16', a), ('fneu', 'b@16', b)), ('funord', a, b), 'options->has_ford_funord'),
+   (('iand', ('feq', 'a@16', a), ('feq', 'b@16', b)), ('ford', a, b), 'options->has_ford_funord'),
+   (('ior', ('fneu', 'a@32', a), ('fneu', 'b@32', b)), ('funord', a, b), 'options->has_ford_funord'),
+   (('iand', ('feq', 'a@32', a), ('feq', 'b@32', b)), ('ford', a, b), 'options->has_ford_funord'),
+   (('ior', ('fneu', 'a@64', a), ('fneu', 'b@64', b)), ('funord', a, b), 'options->has_ford_funord'),
+   (('iand', ('feq', 'a@64', a), ('feq', 'b@64', b)), ('ford', a, b), 'options->has_ford_funord'),
+
+   (('inot', ('ford(is_used_once)', a, b)), ('funord', a, b)),
+   (('inot', ('funord(is_used_once)', a, b)), ('ford', a, b)),
+   (('inot', ('feq(is_used_once)', a, b)), ('fneu', a, b)),
+   (('inot', ('fneu(is_used_once)', a, b)), ('feq', a, b)),
+   (('inot', ('fequ(is_used_once)', a, b)), ('fneo', a, b)),
+   (('inot', ('fneo(is_used_once)', a, b)), ('fequ', a, b)),
+   (('inot', ('flt(is_used_once)', a, b)), ('fgeu', a, b), 'options->has_fneo_fcmpu'),
+   (('inot', ('fgeu(is_used_once)', a, b)), ('flt', a, b)),
+   (('inot', ('fge(is_used_once)', a, b)), ('fltu', a, b), 'options->has_fneo_fcmpu'),
+   (('inot', ('fltu(is_used_once)', a, b)), ('fge', a, b)),
 
    # nir_lower_to_source_mods will collapse this, but its existence during the
    # optimization loop can prevent other optimizations.
@@ -3073,15 +3186,36 @@ late_optimizations.extend([
    (('iadd', a, ('ineg', 'b')), ('isub', 'a', 'b'), 'options->has_isub || options->lower_ineg'),
    (('ineg', a), ('isub', 0, a), 'options->lower_ineg'),
    (('iabs', a), ('imax', a, ('ineg', a)), 'options->lower_iabs'),
+])
+
+for s in [8, 16, 32, 64]:
+   cond = 'options->has_iadd3'
+   if s == 64:
+      cond += ' && !(options->lower_int64_options & nir_lower_iadd3_64)'
+
+   iadd = "iadd@{}".format(s)
+
    # On Intel GPUs, the constant field for an ADD3 instruction must be either
    # int16_t or uint16_t.
-   (('iadd', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), 'c(is_not_const)'), ('iadd3', a, b, c), 'options->has_iadd3'),
-   (('iadd', ('iadd(is_used_once)', '#a(is_16_bits)',  'b(is_not_const)'), 'c(is_not_const)'), ('iadd3', a, b, c), 'options->has_iadd3'),
-   (('iadd', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c(is_16_bits)'),   ('iadd3', a, b, c), 'options->has_iadd3'),
-   (('iadd', ('ineg', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)')), 'c(is_not_const)'), ('iadd3', ('ineg', a), ('ineg', b), c), 'options->has_iadd3'),
-   (('iadd', ('ineg', ('iadd(is_used_once)', '#a(is_16_bits)',  'b(is_not_const)')), 'c(is_not_const)'), ('iadd3', ('ineg', a), ('ineg', b), c), 'options->has_iadd3'),
-   (('iadd', ('ineg', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)')), '#c(is_16_bits)'),  ('iadd3', ('ineg', a), ('ineg', b), c), 'options->has_iadd3'),
+   late_optimizations.extend([
+      ((iadd, ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), 'c(is_not_const)'), ('iadd3', a, b, c), cond),
+      ((iadd, ('iadd(is_used_once)', '#a(is_16_bits)',  'b(is_not_const)'), 'c(is_not_const)'), ('iadd3', a, b, c), cond),
+      ((iadd, ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c(is_16_bits)'),   ('iadd3', a, b, c), cond),
+      ((iadd, ('ineg', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)')), 'c(is_not_const)'), ('iadd3', ('ineg', a), ('ineg', b), c), cond),
+      ((iadd, ('ineg', ('iadd(is_used_once)', '#a(is_16_bits)',  'b(is_not_const)')), 'c(is_not_const)'), ('iadd3', ('ineg', a), ('ineg', b), c), cond),
+      ((iadd, ('ineg', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)')), '#c(is_16_bits)'),  ('iadd3', ('ineg', a), ('ineg', b), c), cond),
 
+      ((iadd, ('ishl', a, 1), 'b(is_not_const)'), ('iadd3', a, a, b), cond),
+      ((iadd, ('ishl', a, 1), '#b(is_16_bits)' ), ('iadd3', a, a, b), cond),
+      ((iadd, ('ineg', ('ishl', a, 1)), 'b(is_not_const)'), ('iadd3', ('ineg', a), ('ineg', a), b), cond),
+      ((iadd, ('ineg', ('ishl', a, 1)), '#b(is_16_bits)' ), ('iadd3', ('ineg', a), ('ineg', a), b), cond),
+
+      # Use special checks to ensure (b+b) or -(b+b) fit in 16 bits.
+      (('ishl@{}'.format(s), ('iadd', a, '#b(is_2x_16_bits)'), 1), ('iadd3', a, a, ('iadd', b, b)), cond),
+      (('ishl@{}'.format(s), ('ineg', ('iadd', a, '#b(is_neg2x_16_bits)')), 1), ('iadd3', ('ineg', a), ('ineg', a), ('ineg', ('iadd', b, b))), cond),
+   ])
+
+late_optimizations.extend([
     # fneg_lo / fneg_hi
    (('vec2(is_only_used_as_float)', ('fneg@16', a), b), ('fmul', ('vec2', a, b), ('vec2', -1.0, 1.0)), 'options->vectorize_vec2_16bit'),
    (('vec2(is_only_used_as_float)', a, ('fneg@16', b)), ('fmul', ('vec2', a, b), ('vec2', 1.0, -1.0)), 'options->vectorize_vec2_16bit'),
@@ -3418,10 +3552,54 @@ distribute_src_mods = [
    (('fabs', ('fsign(is_used_once)', a)), ('fsign', ('fabs', a))),
 ]
 
-print(nir_algebraic.AlgebraicPass("nir_opt_algebraic", optimizations).render())
-print(nir_algebraic.AlgebraicPass("nir_opt_algebraic_before_ffma",
-                                  before_ffma_optimizations).render())
-print(nir_algebraic.AlgebraicPass("nir_opt_algebraic_late",
-                                  late_optimizations).render())
-print(nir_algebraic.AlgebraicPass("nir_opt_algebraic_distribute_src_mods",
-                                  distribute_src_mods).render())
+before_lower_int64_optimizations = [
+    # The i2i64(a) implies that 'a' has at most 32-bits of data.
+    (('ishl', ('i2i64', a), b),
+     # Effective shift count of zero, just return 'a'.
+     ('bcsel', ('ieq', ('iand', b, 63), 0), ('i2i64', a),
+      ('bcsel', ('ilt', ('iand', b, 63), 32),
+       # Shifting less than 32 bits, so both 32-bit halves will have
+       # some data. These (and the else case) shift counts are of 32-bit
+       # values, so the shift counts are implicitly moduolo 32.
+       ('pack_64_2x32_split', ('ishl', ('i2i32', a), b), ('ishr', ('i2i32', a),          ('iadd', ('ineg', b), 32) )),
+       # Shifting 32 bits or more, so lower 32 bits must be zero.
+       ('pack_64_2x32_split', 0                        , ('ishl', ('i2i32', a), ('iabs', ('iadd', ('ineg', b), 32)))))),
+     '(options->lower_int64_options & nir_lower_shift64) != 0'),
+
+    (('ishl', ('u2u64', a), b),
+     ('bcsel', ('ieq', ('iand', b, 63), 0), ('u2u64', a),
+      ('bcsel', ('ilt', ('iand', b, 63), 32),
+       ('pack_64_2x32_split', ('ishl', ('u2u32', a), b), ('ushr', ('u2u32', a),          ('iadd', ('ineg', b), 32) )),
+       ('pack_64_2x32_split', 0                        , ('ishl', ('u2u32', a), ('iabs', ('iadd', ('ineg', b), 32)))))),
+     '(options->lower_int64_options & nir_lower_shift64) != 0'),
+
+    # If ineg64 is lowered, then the negation is not free. Try to eliminate
+    # some of the negations.
+    (('iadd@64', ('ineg', a), ('ineg(is_used_once)', b)), ('isub', ('ineg', a), b), '(options->lower_int64_options & nir_lower_ineg64) != 0'),
+    (('iadd@64', a, ('ineg', b)), ('isub', a, b), '(options->lower_int64_options & nir_lower_ineg64) != 0'),
+    (('isub@64', a, ('ineg', b)), ('iadd', a, b), '(options->lower_int64_options & nir_lower_ineg64) != 0'),
+    (('isub@64', ('ineg', a), ('ineg', b)), ('isub', b, a), '(options->lower_int64_options & nir_lower_ineg64) != 0'),
+
+    (('imul@64', ('ineg', a), ('ineg', b)), ('imul', a, b)),
+    (('idiv@64', ('ineg', a), ('ineg', b)), ('idiv', a, b)),
+
+    # If the hardware can do int64, the shift is the same cost as the add. It
+    # should be fine to do this transformation unconditionally.
+    (('iadd', ('i2i64', a), ('i2i64', a)), ('ishl', ('i2i64', a), 1)),
+    (('iadd', ('u2u64', a), ('u2u64', a)), ('ishl', ('u2u64', a), 1)),
+]
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--out', required=True)
+args = parser.parse_args()
+
+with open(args.out, "w", encoding='utf-8') as f:
+    f.write(nir_algebraic.AlgebraicPass("nir_opt_algebraic", optimizations).render())
+    f.write(nir_algebraic.AlgebraicPass("nir_opt_algebraic_before_ffma",
+                                        before_ffma_optimizations).render())
+    f.write(nir_algebraic.AlgebraicPass("nir_opt_algebraic_before_lower_int64",
+                                        before_lower_int64_optimizations).render())
+    f.write(nir_algebraic.AlgebraicPass("nir_opt_algebraic_late",
+                                        late_optimizations).render())
+    f.write(nir_algebraic.AlgebraicPass("nir_opt_algebraic_distribute_src_mods",
+                                        distribute_src_mods).render())

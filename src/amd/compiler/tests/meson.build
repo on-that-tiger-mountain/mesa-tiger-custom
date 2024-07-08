@@ -1,5 +1,4 @@
 # Copyright © 2020 Valve Corporation
-#
 # SPDX-License-Identifier: MIT
 
 aco_tests_files = files(
@@ -30,10 +29,14 @@ spirv_files = files(
   'test_d3d11_derivs.cpp',
 )
 
-gen_spirv = generator(prog_python,
-                      output    : '@BASENAME@-spirv.h',
-                      arguments : [join_paths(meson.current_source_dir(), 'glsl_scraper.py'),
-                                   '@INPUT@', '--with-glslang', prog_glslang.full_path(), '-o', '@OUTPUT@'])
+gen_spirv = generator(
+  prog_python,
+  output : '@BASENAME@-spirv.h',
+  arguments : [
+    join_paths(meson.current_source_dir(), 'glsl_scraper.py'),
+    '@INPUT@', '--with-glslang', prog_glslang.full_path(), '-o', '@OUTPUT@',
+  ],
+)
 gen_spirv_files = gen_spirv.process(spirv_files)
 
 test(

@@ -5,6 +5,7 @@
 
 use crate::api::GetDebugFlags;
 use crate::api::DEBUG;
+use crate::builder::*;
 use crate::cfg::CFGBuilder;
 use crate::ir::*;
 use crate::nir::*;
@@ -309,8 +310,12 @@ impl<'a> ShaderFromNir<'a> {
         }
     }
 
+    fn get_ssa_ref(&mut self, src: &nir_src) -> SSARef {
+        SSARef::try_from(self.get_ssa(src.as_def())).unwrap()
+    }
+
     fn get_src(&mut self, src: &nir_src) -> Src {
-        SSARef::try_from(self.get_ssa(src.as_def())).unwrap().into()
+        self.get_ssa_ref(src).into()
     }
 
     fn get_io_addr_offset(
@@ -330,6 +335,15 @@ impl<'a> ShaderFromNir<'a> {
             (base.into(), addr_offset.offset)
         } else {
             (SrcRef::Zero.into(), addr_offset.offset)
+        }
+    }
+
+    fn get_cbuf_addr_offset(&mut self, addr: &nir_src) -> (Src, u16) {
+        let (off, off_imm) = self.get_io_addr_offset(addr, 16);
+        if let Ok(off_imm_u16) = u16::try_from(off_imm) {
+            (off, off_imm_u16)
+        } else {
+            (self.get_src(addr), 0)
         }
     }
 
@@ -452,8 +466,9 @@ impl<'a> ShaderFromNir<'a> {
             _ => (),
         }
 
+        let nir_srcs = alu.srcs_as_slice();
         let mut srcs: Vec<Src> = Vec::new();
-        for (i, alu_src) in alu.srcs_as_slice().iter().enumerate() {
+        for (i, alu_src) in nir_srcs.iter().enumerate() {
             let bit_size = alu_src.src.bit_size();
             let comps = alu.src_components(i.try_into().unwrap());
             let ssa = self.get_ssa(alu_src.src.as_def());
@@ -699,7 +714,7 @@ impl<'a> ShaderFromNir<'a> {
             }
             nir_op_fabs | nir_op_fadd | nir_op_fneg => {
                 let (x, y) = match alu.op {
-                    nir_op_fabs => (srcs[0].fabs(), 0.into()),
+                    nir_op_fabs => (Src::new_zero().fneg(), srcs[0].fabs()),
                     nir_op_fadd => (srcs[0], srcs[1]),
                     nir_op_fneg => (Src::new_zero().fneg(), srcs[0].fneg()),
                     _ => panic!("Unhandled case"),
@@ -1302,13 +1317,17 @@ impl<'a> ShaderFromNir<'a> {
                 if alu.def.bit_size() == 64 {
                     // For 64-bit shifts, we have to use clamp mode so we need
                     // to mask the shift in order satisfy NIR semantics.
-                    let shift = b.lop2(LogicOp2::And, shift, 0x3f.into());
+                    let shift = if let Some(s) = nir_srcs[1].comp_as_uint(0) {
+                        ((s & 0x3f) as u32).into()
+                    } else {
+                        b.lop2(LogicOp2::And, shift, 0x3f.into()).into()
+                    };
                     let dst = b.alloc_ssa(RegFile::GPR, 2);
                     b.push_op(OpShf {
                         dst: dst[0].into(),
                         low: 0.into(),
                         high: x[0].into(),
-                        shift: shift.into(),
+                        shift,
                         right: false,
                         wrap: false,
                         data_type: IntType::U32,
@@ -1318,7 +1337,7 @@ impl<'a> ShaderFromNir<'a> {
                         dst: dst[1].into(),
                         low: x[0].into(),
                         high: x[1].into(),
-                        shift: shift.into(),
+                        shift,
                         right: false,
                         wrap: false,
                         data_type: IntType::U64,
@@ -1336,13 +1355,17 @@ impl<'a> ShaderFromNir<'a> {
                 if alu.def.bit_size() == 64 {
                     // For 64-bit shifts, we have to use clamp mode so we need
                     // to mask the shift in order satisfy NIR semantics.
-                    let shift = b.lop2(LogicOp2::And, shift, 0x3f.into());
+                    let shift = if let Some(s) = nir_srcs[1].comp_as_uint(0) {
+                        ((s & 0x3f) as u32).into()
+                    } else {
+                        b.lop2(LogicOp2::And, shift, 0x3f.into()).into()
+                    };
                     let dst = b.alloc_ssa(RegFile::GPR, 2);
                     b.push_op(OpShf {
                         dst: dst[0].into(),
                         low: x[0].into(),
                         high: x[1].into(),
-                        shift: shift.into(),
+                        shift,
                         right: true,
                         wrap: false,
                         data_type: IntType::I64,
@@ -1352,7 +1375,7 @@ impl<'a> ShaderFromNir<'a> {
                         dst: dst[1].into(),
                         low: x[0].into(),
                         high: x[1].into(),
-                        shift: shift.into(),
+                        shift,
                         right: true,
                         wrap: false,
                         data_type: IntType::I32,
@@ -1544,13 +1567,17 @@ impl<'a> ShaderFromNir<'a> {
                 if alu.def.bit_size() == 64 {
                     // For 64-bit shifts, we have to use clamp mode so we need
                     // to mask the shift in order satisfy NIR semantics.
-                    let shift = b.lop2(LogicOp2::And, shift, 0x3f.into());
+                    let shift = if let Some(s) = nir_srcs[1].comp_as_uint(0) {
+                        ((s & 0x3f) as u32).into()
+                    } else {
+                        b.lop2(LogicOp2::And, shift, 0x3f.into()).into()
+                    };
                     let dst = b.alloc_ssa(RegFile::GPR, 2);
                     b.push_op(OpShf {
                         dst: dst[0].into(),
                         low: x[0].into(),
                         high: x[1].into(),
-                        shift: shift.into(),
+                        shift,
                         right: true,
                         wrap: false,
                         data_type: IntType::U64,
@@ -1560,7 +1587,7 @@ impl<'a> ShaderFromNir<'a> {
                         dst: dst[1].into(),
                         low: x[0].into(),
                         high: x[1].into(),
-                        shift: shift.into(),
+                        shift,
                         right: true,
                         wrap: false,
                         data_type: IntType::U32,
@@ -2027,6 +2054,19 @@ impl<'a> ShaderFromNir<'a> {
                     panic!("Invalid VTG I/O intrinsic");
                 }
             }
+            nir_intrinsic_as_uniform => {
+                let src = self.get_ssa(srcs[0].as_def());
+                let mut dst = Vec::new();
+                for comp in src {
+                    let u = b.alloc_ssa(RegFile::UGPR, 1);
+                    b.push_op(OpR2UR {
+                        src: [*comp].into(),
+                        dst: u.into(),
+                    });
+                    dst.push(u[0]);
+                }
+                self.set_ssa(&intrin.def, dst);
+            }
             nir_intrinsic_ballot => {
                 assert!(srcs[0].bit_size() == 1);
                 let src = self.get_src(&srcs[0]);
@@ -2271,7 +2311,7 @@ impl<'a> ShaderFromNir<'a> {
 
                 b.push_op(OpFSOut { srcs: srcs });
             }
-            nir_intrinsic_demote | nir_intrinsic_discard => {
+            nir_intrinsic_demote => {
                 if let ShaderIoInfo::Fragment(info) = &mut self.info.io {
                     info.uses_kill = true;
                 } else {
@@ -2279,7 +2319,7 @@ impl<'a> ShaderFromNir<'a> {
                 }
                 b.push_op(OpKill {});
             }
-            nir_intrinsic_demote_if | nir_intrinsic_discard_if => {
+            nir_intrinsic_demote_if => {
                 if let ShaderIoInfo::Fragment(info) = &mut self.info.io {
                     info.uses_kill = true;
                 } else {
@@ -2592,18 +2632,12 @@ impl<'a> ShaderFromNir<'a> {
                 }
                 self.set_dst(&intrin.def, dst);
             }
-            nir_intrinsic_load_ubo => {
+            nir_intrinsic_ldc_nv => {
                 let size_B =
                     (intrin.def.bit_size() / 8) * intrin.def.num_components();
                 let idx = &srcs[0];
 
-                let (off, off_imm) = self.get_io_addr_offset(&srcs[1], 16);
-                let (off, off_imm) =
-                    if let Ok(off_imm_u16) = u16::try_from(off_imm) {
-                        (off, off_imm_u16)
-                    } else {
-                        (self.get_src(&srcs[1]), 0)
-                    };
+                let (off, off_imm) = self.get_cbuf_addr_offset(&srcs[1]);
 
                 let dst = b.alloc_ssa(RegFile::GPR, size_B.div_ceil(4));
 
@@ -2651,6 +2685,49 @@ impl<'a> ShaderFromNir<'a> {
                     });
                 }
                 self.set_dst(&intrin.def, dst);
+            }
+            nir_intrinsic_ldcx_nv => {
+                let size_B =
+                    (intrin.def.bit_size() / 8) * intrin.def.num_components();
+
+                let handle = self.get_ssa_ref(&srcs[0]);
+                let (off, off_imm) = self.get_cbuf_addr_offset(&srcs[1]);
+
+                let cb = CBufRef {
+                    buf: CBuf::BindlessSSA(handle),
+                    offset: off_imm,
+                };
+
+                let dst = b.alloc_ssa(RegFile::GPR, size_B.div_ceil(4));
+                if off.is_zero() {
+                    for (i, comp) in dst.iter().enumerate() {
+                        let i = u16::try_from(i).unwrap();
+                        b.copy_to((*comp).into(), cb.offset(i * 4).into());
+                    }
+                } else {
+                    b.push_op(OpLdc {
+                        dst: dst.into(),
+                        cb: cb.into(),
+                        offset: off,
+                        mode: LdcMode::Indexed,
+                        mem_type: MemType::from_size(size_B, false),
+                    });
+                }
+                self.set_dst(&intrin.def, dst);
+            }
+            nir_intrinsic_pin_cx_handle_nv => {
+                let handle = self.get_ssa_ref(&srcs[0]);
+                b.push_op(OpPin {
+                    src: handle.into(),
+                    dst: handle.into(),
+                });
+            }
+            nir_intrinsic_unpin_cx_handle_nv => {
+                let handle = self.get_ssa_ref(&srcs[0]);
+                b.push_op(OpUnpin {
+                    src: handle.into(),
+                    dst: handle.into(),
+                });
             }
             nir_intrinsic_barrier => {
                 let modes = intrin.memory_modes();
@@ -3093,25 +3170,10 @@ impl<'a> ShaderFromNir<'a> {
 
         let mut phi = OpPhiDsts::new();
         for ni in nb.iter_instr_list() {
-            if ni.type_ == nir_instr_type_phi {
-                let np = ni.as_phi().unwrap();
-                let dst = alloc_ssa_for_nir(&mut b, np.def.as_def());
-                for (i, dst) in dst.iter().enumerate() {
-                    let phi_id = phi_map.get_phi_id(np, i.try_into().unwrap());
-                    phi.dsts.push(phi_id, (*dst).into());
-                }
-                self.set_ssa(np.def.as_def(), dst);
-            } else {
+            let Some(np) = ni.as_phi() else {
                 break;
-            }
-        }
+            };
 
-        if !phi.dsts.is_empty() {
-            b.push_op(phi);
-        }
-
-        let mut goto = None;
-        for ni in nb.iter_instr_list() {
             if DEBUG.annotate() {
                 let annotation = self
                     .nir_instr_printer
@@ -3123,6 +3185,51 @@ impl<'a> ShaderFromNir<'a> {
                     annotation: format!("generated by \"{}\"", annotation,),
                 });
             }
+
+            let uniform = !nb.divergent
+                && self.info.sm >= 75
+                && !DEBUG.no_ugpr()
+                && !np.def.divergent;
+
+            // This should be ensured by nak_nir_lower_cf()
+            if uniform {
+                for ps in np.iter_srcs() {
+                    assert!(!ps.pred().divergent);
+                }
+            }
+
+            let mut b = UniformBuilder::new(&mut b, uniform);
+            let dst = alloc_ssa_for_nir(&mut b, np.def.as_def());
+            for i in 0..dst.len() {
+                let phi_id = phi_map.get_phi_id(np, i.try_into().unwrap());
+                phi.dsts.push(phi_id, dst[i].into());
+            }
+            self.set_ssa(np.def.as_def(), dst);
+        }
+
+        if !phi.dsts.is_empty() {
+            b.push_op(phi);
+        }
+
+        let mut goto = None;
+        for ni in nb.iter_instr_list() {
+            if DEBUG.annotate() && ni.type_ != nir_instr_type_phi {
+                let annotation = self
+                    .nir_instr_printer
+                    .instr_to_string(ni)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                b.push_op(OpAnnotate {
+                    annotation: format!("generated by \"{}\"", annotation,),
+                });
+            }
+
+            let uniform = !nb.divergent
+                && self.info.sm >= 75
+                && !DEBUG.no_ugpr()
+                && ni.def().is_some_and(|d| !d.divergent);
+            let mut b = UniformBuilder::new(&mut b, uniform);
 
             match ni.type_ {
                 nir_instr_type_alu => {
@@ -3162,11 +3269,22 @@ impl<'a> ShaderFromNir<'a> {
 
             let mut phi = OpPhiSrcs::new();
 
-            for i in sb.iter_instr_list() {
-                let np = match i.as_phi() {
-                    Some(phi) => phi,
-                    None => break,
+            for ni in sb.iter_instr_list() {
+                let Some(np) = ni.as_phi() else {
+                    break;
                 };
+
+                if DEBUG.annotate() {
+                    let annotation = self
+                        .nir_instr_printer
+                        .instr_to_string(ni)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    b.push_op(OpAnnotate {
+                        annotation: format!("generated by \"{}\"", annotation,),
+                    });
+                }
 
                 for ps in np.iter_srcs() {
                     if ps.pred().index == nb.index {
@@ -3239,8 +3357,11 @@ impl<'a> ShaderFromNir<'a> {
             }
         }
 
-        let mut bb = BasicBlock::new(self.get_block_label(nb));
-        bb.instrs.append(&mut b.as_vec());
+        let bb = BasicBlock {
+            label: self.get_block_label(nb),
+            uniform: !nb.divergent,
+            instrs: b.as_vec(),
+        };
         self.cfg.add_node(nb.index, bb);
     }
 
@@ -3306,11 +3427,13 @@ impl<'a> ShaderFromNir<'a> {
             }
         }
 
-        Function {
+        let mut f = Function {
             ssa_alloc: ssa_alloc,
             phi_alloc: phi_alloc,
             blocks: cfg,
-        }
+        };
+        f.repair_ssa();
+        f
     }
 
     pub fn parse_shader(mut self) -> Shader {

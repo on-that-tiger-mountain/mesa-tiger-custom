@@ -128,69 +128,7 @@
 #define SMIMM_C .small_imm_c = true
 #define SMIMM_D .small_imm_d = true
 
-static const struct v3d_qpu_sig v33_sig_map[] = {
-        /*      MISC   R3       R4      R5 */
-        [0]  = {                               },
-        [1]  = { THRSW,                        },
-        [2]  = {                        LDUNIF },
-        [3]  = { THRSW,                 LDUNIF },
-        [4]  = {                LDTMU,         },
-        [5]  = { THRSW,         LDTMU,         },
-        [6]  = {                LDTMU,  LDUNIF },
-        [7]  = { THRSW,         LDTMU,  LDUNIF },
-        [8]  = {        LDVARY,                },
-        [9]  = { THRSW, LDVARY,                },
-        [10] = {        LDVARY,         LDUNIF },
-        [11] = { THRSW, LDVARY,         LDUNIF },
-        [12] = {        LDVARY, LDTMU,         },
-        [13] = { THRSW, LDVARY, LDTMU,         },
-        [14] = { SMIMM_B, LDVARY,              },
-        [15] = { SMIMM_B,                      },
-        [16] = {        LDTLB,                 },
-        [17] = {        LDTLBU,                },
-        /* 18-21 reserved */
-        [22] = { UCB,                          },
-        [23] = { ROT,                          },
-        [24] = {        LDVPM,                 },
-        [25] = { THRSW, LDVPM,                 },
-        [26] = {        LDVPM,          LDUNIF },
-        [27] = { THRSW, LDVPM,          LDUNIF },
-        [28] = {        LDVPM, LDTMU,          },
-        [29] = { THRSW, LDVPM, LDTMU,          },
-        [30] = { SMIMM_B, LDVPM,               },
-        [31] = { SMIMM_B,                      },
-};
-
-static const struct v3d_qpu_sig v40_sig_map[] = {
-        /*      MISC    R3      R4      R5 */
-        [0]  = {                               },
-        [1]  = { THRSW,                        },
-        [2]  = {                        LDUNIF },
-        [3]  = { THRSW,                 LDUNIF },
-        [4]  = {                LDTMU,         },
-        [5]  = { THRSW,         LDTMU,         },
-        [6]  = {                LDTMU,  LDUNIF },
-        [7]  = { THRSW,         LDTMU,  LDUNIF },
-        [8]  = {        LDVARY,                },
-        [9]  = { THRSW, LDVARY,                },
-        [10] = {        LDVARY,         LDUNIF },
-        [11] = { THRSW, LDVARY,         LDUNIF },
-        /* 12-13 reserved */
-        [14] = { SMIMM_B, LDVARY,              },
-        [15] = { SMIMM_B,                      },
-        [16] = {        LDTLB,                 },
-        [17] = {        LDTLBU,                },
-        [18] = {                        WRTMUC },
-        [19] = { THRSW,                 WRTMUC },
-        [20] = {        LDVARY,         WRTMUC },
-        [21] = { THRSW, LDVARY,         WRTMUC },
-        [22] = { UCB,                          },
-        [23] = { ROT,                          },
-        /* 24-30 reserved */
-        [31] = { SMIMM_B,       LDTMU,         },
-};
-
-static const struct v3d_qpu_sig v41_sig_map[] = {
+static const struct v3d_qpu_sig v3d42_sig_map[] = {
         /*      MISC       phys    R5 */
         [0]  = {                          },
         [1]  = { THRSW,                   },
@@ -223,7 +161,7 @@ static const struct v3d_qpu_sig v41_sig_map[] = {
 };
 
 
-static const struct v3d_qpu_sig v71_sig_map[] = {
+static const struct v3d_qpu_sig v3d71_sig_map[] = {
         /*      MISC       phys    RF0 */
         [0]  = {                          },
         [1]  = { THRSW,                   },
@@ -251,7 +189,9 @@ static const struct v3d_qpu_sig v71_sig_map[] = {
         /* 23 reserved */
         [24] = {                   LDUNIFA},
         [25] = { LDUNIFARF                },
-        /* 26-29 reserved */
+        [26] = {           LDTMU,         WRTMUC },
+        [27] = { THRSW,    LDTMU,         WRTMUC },
+        /* 28-29 reserved */
         [30] = { SMIMM_C,                 },
         [31] = { SMIMM_D,                 },
 };
@@ -261,21 +201,17 @@ v3d_qpu_sig_unpack(const struct v3d_device_info *devinfo,
                    uint32_t packed_sig,
                    struct v3d_qpu_sig *sig)
 {
-        if (packed_sig >= ARRAY_SIZE(v33_sig_map))
+        if (packed_sig >= ARRAY_SIZE(v3d42_sig_map))
                 return false;
 
         if (devinfo->ver >= 71)
-                *sig = v71_sig_map[packed_sig];
-        else if (devinfo->ver >= 41)
-                *sig = v41_sig_map[packed_sig];
-        else if (devinfo->ver == 40)
-                *sig = v40_sig_map[packed_sig];
+                *sig = v3d71_sig_map[packed_sig];
         else
-                *sig = v33_sig_map[packed_sig];
+                *sig = v3d42_sig_map[packed_sig];
 
         /* Signals with zeroed unpacked contents after element 0 are reserved. */
         return (packed_sig == 0 ||
-                memcmp(sig, &v33_sig_map[0], sizeof(*sig)) != 0);
+                memcmp(sig, &v3d42_sig_map[0], sizeof(*sig)) != 0);
 }
 
 bool
@@ -286,15 +222,11 @@ v3d_qpu_sig_pack(const struct v3d_device_info *devinfo,
         static const struct v3d_qpu_sig *map;
 
         if (devinfo->ver >= 71)
-                map = v71_sig_map;
-        else if (devinfo->ver >= 41)
-                map = v41_sig_map;
-        else if (devinfo->ver == 40)
-                map = v40_sig_map;
+                map = v3d71_sig_map;
         else
-                map = v33_sig_map;
+                map = v3d42_sig_map;
 
-        for (int i = 0; i < ARRAY_SIZE(v33_sig_map); i++) {
+        for (int i = 0; i < ARRAY_SIZE(v3d42_sig_map); i++) {
                 if (memcmp(&map[i], sig, sizeof(*sig)) == 0) {
                         *packed_sig = i;
                         return true;
@@ -522,7 +454,7 @@ struct opcode_desc {
         uint8_t last_ver;
 };
 
-static const struct opcode_desc add_ops_v33[] = {
+static const struct opcode_desc v3d42_add_ops[] = {
         /* FADD is FADDNF depending on the order of the mux_a/mux_b. */
         { 0,   47,  .mux.b_mask = ANYMUX, .mux.a_mask = ANYMUX, V3D_QPU_A_FADD },
         { 0,   47,  .mux.b_mask = ANYMUX, .mux.a_mask = ANYMUX, V3D_QPU_A_FADDNF },
@@ -626,7 +558,7 @@ static const struct opcode_desc add_ops_v33[] = {
         { 252, 252, .mux.b_mask = OP_RANGE(4, 6), .mux.a_mask = ANYMUX, V3D_QPU_A_UTOF },
 };
 
-static const struct opcode_desc mul_ops_v33[] = {
+static const struct opcode_desc v3d42_mul_ops[] = {
         { 1, 1, .mux.b_mask = ANYMUX, .mux.a_mask = ANYMUX, V3D_QPU_M_ADD },
         { 2, 2, .mux.b_mask = ANYMUX, .mux.a_mask = ANYMUX, V3D_QPU_M_SUB },
         { 3, 3, .mux.b_mask = ANYMUX, .mux.a_mask = ANYMUX, V3D_QPU_M_UMUL24 },
@@ -643,14 +575,14 @@ static const struct opcode_desc mul_ops_v33[] = {
 
 /* Note that it would have been possible to define all the add/mul opcodes in
  * just one table, using the first_ver/last_ver. But taking into account that
- * for v71 there were a lot of changes, it was more tidy this way. Also right
- * now we are doing a linear search on those tables, so this maintains the
- * tables smaller.
+ * for v3d71 there were a lot of changes, it was more tidy this way. Also
+ * right now we are doing a linear search on those tables, so this maintains
+ * the tables smaller.
  *
  * Just in case we merge the tables, we define the first_ver as 71 for those
- * opcodes that changed on v71
+ * opcodes that changed on v3d71
  */
-static const struct opcode_desc add_ops_v71[] = {
+static const struct opcode_desc v3d71_add_ops[] = {
         /* FADD is FADDNF depending on the order of the raddr_a/raddr_b. */
         { 0,   47,  .raddr_mask = ANYOPMASK, V3D_QPU_A_FADD },
         { 0,   47,  .raddr_mask = ANYOPMASK, V3D_QPU_A_FADDNF },
@@ -812,7 +744,7 @@ static const struct opcode_desc add_ops_v71[] = {
         { 254, 254, .raddr_mask = ANYOPMASK, V3D_QPU_A_SHUFFLE, 71 },
 };
 
-static const struct opcode_desc mul_ops_v71[] = {
+static const struct opcode_desc v3d71_mul_ops[] = {
         /* For V3D 7.1, second mask field would be ignored */
         { 1, 1, .raddr_mask = ANYOPMASK, V3D_QPU_M_ADD, 71 },
         { 2, 2, .raddr_mask = ANYOPMASK, V3D_QPU_M_SUB, 71 },
@@ -1062,7 +994,7 @@ v3d_qpu_float32_pack_pack(enum v3d_qpu_output_pack pack,
 }
 
 static bool
-v3d33_qpu_add_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst,
+v3d42_qpu_add_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst,
                      struct v3d_qpu_instr *instr)
 {
         uint32_t op = QPU_GET_FIELD(packed_inst, V3D_QPU_OP_ADD);
@@ -1080,8 +1012,8 @@ v3d33_qpu_add_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst
                 map_op = (map_op - 253 + 245);
 
         const struct opcode_desc *desc =
-                lookup_opcode_from_packed(devinfo, add_ops_v33,
-                                          ARRAY_SIZE(add_ops_v33),
+                lookup_opcode_from_packed(devinfo, v3d42_add_ops,
+                                          ARRAY_SIZE(v3d42_add_ops),
                                           map_op, mux_a, mux_b, 0);
 
         if (!desc)
@@ -1229,8 +1161,8 @@ v3d71_qpu_add_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst
 
         const struct opcode_desc *desc =
                 lookup_opcode_from_packed(devinfo,
-                                          add_ops_v71,
-                                          ARRAY_SIZE(add_ops_v71),
+                                          v3d71_add_ops,
+                                          ARRAY_SIZE(v3d71_add_ops),
                                           map_op, 0, 0,
                                           raddr_b);
         if (!desc)
@@ -1328,7 +1260,7 @@ v3d71_qpu_add_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst
 
         case V3D_QPU_A_VFMIN:
         case V3D_QPU_A_VFMAX:
-                unreachable("pending v71 update");
+                unreachable("pending v3d71 update");
                 if (!v3d_qpu_float16_unpack_unpack(op & 0x7,
                                                    &instr->alu.add.a.unpack)) {
                         return false;
@@ -1397,14 +1329,14 @@ static bool
 v3d_qpu_add_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst,
                    struct v3d_qpu_instr *instr)
 {
-        if (devinfo->ver < 71)
-                return v3d33_qpu_add_unpack(devinfo, packed_inst, instr);
-        else
+        if (devinfo->ver >= 71)
                 return v3d71_qpu_add_unpack(devinfo, packed_inst, instr);
+        else
+                return v3d42_qpu_add_unpack(devinfo, packed_inst, instr);
 }
 
 static bool
-v3d33_qpu_mul_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst,
+v3d42_qpu_mul_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst,
                      struct v3d_qpu_instr *instr)
 {
         uint32_t op = QPU_GET_FIELD(packed_inst, V3D_QPU_OP_MUL);
@@ -1414,8 +1346,8 @@ v3d33_qpu_mul_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst
         {
                 const struct opcode_desc *desc =
                         lookup_opcode_from_packed(devinfo,
-                                                  mul_ops_v33,
-                                                  ARRAY_SIZE(mul_ops_v33),
+                                                  v3d42_mul_ops,
+                                                  ARRAY_SIZE(v3d42_mul_ops),
                                                   op, mux_a, mux_b, 0);
                 if (!desc)
                         return false;
@@ -1488,8 +1420,8 @@ v3d71_qpu_mul_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst
         {
                 const struct opcode_desc *desc =
                         lookup_opcode_from_packed(devinfo,
-                                                  mul_ops_v71,
-                                                  ARRAY_SIZE(mul_ops_v71),
+                                                  v3d71_mul_ops,
+                                                  ARRAY_SIZE(v3d71_mul_ops),
                                                   op, 0, 0,
                                                   raddr_d);
                 if (!desc)
@@ -1525,7 +1457,7 @@ v3d71_qpu_mul_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst
                 break;
 
         case V3D_QPU_M_VFMUL:
-                unreachable("pending v71 update");
+                unreachable("pending v3d71 update");
                 instr->alu.mul.output_pack = V3D_QPU_PACK_NONE;
 
                 if (!v3d_qpu_float16_unpack_unpack(((op & 0x7) - 4) & 7,
@@ -1565,10 +1497,10 @@ static bool
 v3d_qpu_mul_unpack(const struct v3d_device_info *devinfo, uint64_t packed_inst,
                    struct v3d_qpu_instr *instr)
 {
-        if (devinfo->ver < 71)
-                return v3d33_qpu_mul_unpack(devinfo, packed_inst, instr);
-        else
+        if (devinfo->ver >= 71)
                 return v3d71_qpu_mul_unpack(devinfo, packed_inst, instr);
+        else
+                return v3d42_qpu_mul_unpack(devinfo, packed_inst, instr);
 }
 
 static const struct opcode_desc *
@@ -1592,7 +1524,7 @@ lookup_opcode_from_instr(const struct v3d_device_info *devinfo,
 }
 
 static bool
-v3d33_qpu_add_pack(const struct v3d_device_info *devinfo,
+v3d42_qpu_add_pack(const struct v3d_device_info *devinfo,
                    const struct v3d_qpu_instr *instr, uint64_t *packed_instr)
 {
         uint32_t waddr = instr->alu.add.waddr;
@@ -1600,8 +1532,8 @@ v3d33_qpu_add_pack(const struct v3d_device_info *devinfo,
         uint32_t mux_b = instr->alu.add.b.mux;
         int nsrc = v3d_qpu_add_op_num_src(instr->alu.add.op);
         const struct opcode_desc *desc =
-                lookup_opcode_from_instr(devinfo, add_ops_v33,
-                                         ARRAY_SIZE(add_ops_v33),
+                lookup_opcode_from_instr(devinfo, v3d42_add_ops,
+                                         ARRAY_SIZE(v3d42_add_ops),
                                          instr->alu.add.op);
 
         if (!desc)
@@ -1815,8 +1747,8 @@ v3d71_qpu_add_pack(const struct v3d_device_info *devinfo,
 
         int nsrc = v3d_qpu_add_op_num_src(instr->alu.add.op);
         const struct opcode_desc *desc =
-                lookup_opcode_from_instr(devinfo, add_ops_v71,
-                                         ARRAY_SIZE(add_ops_v71),
+                lookup_opcode_from_instr(devinfo, v3d71_add_ops,
+                                         ARRAY_SIZE(v3d71_add_ops),
                                          instr->alu.add.op);
         if (!desc)
                 return false;
@@ -2070,7 +2002,7 @@ v3d71_qpu_add_pack(const struct v3d_device_info *devinfo,
 }
 
 static bool
-v3d33_qpu_mul_pack(const struct v3d_device_info *devinfo,
+v3d42_qpu_mul_pack(const struct v3d_device_info *devinfo,
                    const struct v3d_qpu_instr *instr, uint64_t *packed_instr)
 {
         uint32_t mux_a = instr->alu.mul.a.mux;
@@ -2078,8 +2010,8 @@ v3d33_qpu_mul_pack(const struct v3d_device_info *devinfo,
         int nsrc = v3d_qpu_mul_op_num_src(instr->alu.mul.op);
 
         const struct opcode_desc *desc =
-                lookup_opcode_from_instr(devinfo, mul_ops_v33,
-                                         ARRAY_SIZE(mul_ops_v33),
+                lookup_opcode_from_instr(devinfo, v3d42_mul_ops,
+                                         ARRAY_SIZE(v3d42_mul_ops),
                                          instr->alu.mul.op);
 
         if (!desc)
@@ -2192,8 +2124,8 @@ v3d71_qpu_mul_pack(const struct v3d_device_info *devinfo,
         int nsrc = v3d_qpu_mul_op_num_src(instr->alu.mul.op);
 
         const struct opcode_desc *desc =
-                lookup_opcode_from_instr(devinfo, mul_ops_v71,
-                                         ARRAY_SIZE(mul_ops_v71),
+                lookup_opcode_from_instr(devinfo, v3d71_mul_ops,
+                                         ARRAY_SIZE(v3d71_mul_ops),
                                          instr->alu.mul.op);
         if (!desc)
                 return false;
@@ -2251,7 +2183,7 @@ v3d71_qpu_mul_pack(const struct v3d_device_info *devinfo,
         }
 
         case V3D_QPU_M_VFMUL: {
-                unreachable("pending v71 update");
+                unreachable("pending v3d71 update");
                 uint32_t packed;
 
                 if (instr->alu.mul.output_pack != V3D_QPU_PACK_NONE)
@@ -2311,20 +2243,20 @@ static bool
 v3d_qpu_add_pack(const struct v3d_device_info *devinfo,
                  const struct v3d_qpu_instr *instr, uint64_t *packed_instr)
 {
-        if (devinfo->ver < 71)
-                return v3d33_qpu_add_pack(devinfo, instr, packed_instr);
-        else
+        if (devinfo->ver >= 71)
                 return v3d71_qpu_add_pack(devinfo, instr, packed_instr);
+        else
+                return v3d42_qpu_add_pack(devinfo, instr, packed_instr);
 }
 
 static bool
 v3d_qpu_mul_pack(const struct v3d_device_info *devinfo,
                  const struct v3d_qpu_instr *instr, uint64_t *packed_instr)
 {
-        if (devinfo->ver < 71)
-                return v3d33_qpu_mul_pack(devinfo, instr, packed_instr);
-        else
+        if (devinfo->ver >= 71)
                 return v3d71_qpu_mul_pack(devinfo, instr, packed_instr);
+        else
+                return v3d42_qpu_mul_pack(devinfo, instr, packed_instr);
 }
 
 static bool
@@ -2357,8 +2289,8 @@ v3d_qpu_instr_unpack_alu(const struct v3d_device_info *devinfo,
 
         if (devinfo->ver <= 71) {
                 /*
-                 * For v71 this will be set on add/mul unpack, as raddr are now
-                 * part of v3d_qpu_input
+                 * For v3d71 this will be set on add/mul unpack, as raddr are
+                 * now part of v3d_qpu_input
                  */
                 instr->raddr_a = QPU_GET_FIELD(packed_instr, V3D_QPU_RADDR_A);
                 instr->raddr_b = QPU_GET_FIELD(packed_instr, V3D_QPU_RADDR_B);
@@ -2450,8 +2382,8 @@ v3d_qpu_instr_pack_alu(const struct v3d_device_info *devinfo,
         if (instr->type == V3D_QPU_INSTR_TYPE_ALU) {
                 if (devinfo->ver < 71) {
                         /*
-                         * For v71 this will be set on add/mul unpack, as raddr are now
-                         * part of v3d_qpu_input
+                         * For v3d71 this will be set on add/mul unpack, as
+                         * raddr are now part of v3d_qpu_input
                          */
                         *packed_instr |= QPU_SET_FIELD(instr->raddr_a, V3D_QPU_RADDR_A);
                         *packed_instr |= QPU_SET_FIELD(instr->raddr_b, V3D_QPU_RADDR_B);

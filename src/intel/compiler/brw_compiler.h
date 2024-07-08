@@ -1253,6 +1253,7 @@ struct brw_mesh_prog_data {
    enum brw_mesh_index_format index_format;
 
    bool uses_drawid;
+   bool autostrip_enable;
 };
 
 /* brw_any_prog_data is prog_data for any stage that maps to an API stage */
@@ -1556,52 +1557,6 @@ void brw_debug_key_recompile(const struct brw_compiler *c, void *log,
                              const struct brw_base_prog_key *old_key,
                              const struct brw_base_prog_key *key);
 
-/* Shared Local Memory Size is specified as powers of two,
- * and also have a Gen-dependent minimum value if not zero.
- */
-static inline uint32_t
-intel_calculate_slm_size(unsigned gen, uint32_t bytes)
-{
-   assert(bytes <= 64 * 1024);
-   if (bytes > 0)
-      return MAX2(util_next_power_of_two(bytes), gen >= 9 ? 1024 : 4096);
-   else
-      return 0;
-}
-
-static inline uint32_t
-encode_slm_size(unsigned gen, uint32_t bytes)
-{
-   uint32_t slm_size = 0;
-
-   /* Shared Local Memory is specified as powers of two, and encoded in
-    * INTERFACE_DESCRIPTOR_DATA with the following representations:
-    *
-    * Size   | 0 kB | 1 kB | 2 kB | 4 kB | 8 kB | 16 kB | 32 kB | 64 kB |
-    * -------------------------------------------------------------------
-    * Gfx7-8 |    0 | none | none |    1 |    2 |     4 |     8 |    16 |
-    * -------------------------------------------------------------------
-    * Gfx9+  |    0 |    1 |    2 |    3 |    4 |     5 |     6 |     7 |
-    */
-
-   if (bytes > 0) {
-      slm_size = intel_calculate_slm_size(gen, bytes);
-      assert(util_is_power_of_two_nonzero(slm_size));
-
-      if (gen >= 9) {
-         /* Turn an exponent of 10 (1024 kB) into 1. */
-         assert(slm_size >= 1024);
-         slm_size = ffs(slm_size) - 10;
-      } else {
-         assert(slm_size >= 4096);
-         /* Convert to the pre-Gfx9 representation. */
-         slm_size = slm_size / 4096;
-      }
-   }
-
-   return slm_size;
-}
-
 unsigned
 brw_cs_push_const_total_size(const struct brw_cs_prog_data *cs_prog_data,
                              unsigned threads);
@@ -1641,9 +1596,11 @@ brw_stage_has_packed_dispatch(ASSERTED const struct intel_device_info *devinfo,
    /* The code below makes assumptions about the hardware's thread dispatch
     * behavior that could be proven wrong in future generations -- Make sure
     * to do a full test run with brw_fs_test_dispatch_packing() hooked up to
-    * the NIR front-end before changing this assertion.
+    * the NIR front-end before changing this assertion. It can be temporarily
+    * enabled by setting the macro below to true.
     */
-   assert(devinfo->ver <= 12);
+   #define ENABLE_FS_TEST_DISPATCH_PACKING false
+   assert(devinfo->ver <= 20);
 
    switch (stage) {
    case MESA_SHADER_FRAGMENT: {

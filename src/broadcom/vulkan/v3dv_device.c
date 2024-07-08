@@ -170,6 +170,7 @@ get_device_extensions(const struct v3dv_physical_device *device,
       .KHR_maintenance2                     = true,
       .KHR_maintenance3                     = true,
       .KHR_maintenance4                     = true,
+      .KHR_maintenance5                     = true,
       .KHR_multiview                        = true,
       .KHR_pipeline_executable_properties   = true,
       .KHR_separate_depth_stencil_layouts   = true,
@@ -497,6 +498,9 @@ get_features(const struct v3dv_physical_device *physical_device,
       /* VK_KHR_dynamic_rendering */
       .dynamicRendering = true,
 
+      /* VK_KHR_maintenance5 */
+      .maintenance5 = true,
+
 #ifdef V3DV_USE_WSI_PLATFORM
       /* VK_EXT_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
@@ -560,33 +564,44 @@ v3dv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    instance->vk.physical_devices.enumerate = enumerate_devices;
    instance->vk.physical_devices.destroy = destroy_physical_device;
 
-   /* We start with the default values for the pipeline_cache envvars */
+   /* We start with the default values for the pipeline_cache envvars.
+    *
+    * FIXME: with so many options now, perhaps we could use parse_debug_string
+    */
    instance->pipeline_cache_enabled = true;
    instance->default_pipeline_cache_enabled = true;
+   instance->meta_cache_enabled = true;
    const char *pipeline_cache_str = getenv("V3DV_ENABLE_PIPELINE_CACHE");
    if (pipeline_cache_str != NULL) {
       if (strncmp(pipeline_cache_str, "full", 4) == 0) {
          /* nothing to do, just to filter correct values */
       } else if (strncmp(pipeline_cache_str, "no-default-cache", 16) == 0) {
          instance->default_pipeline_cache_enabled = false;
+      } else if (strncmp(pipeline_cache_str, "no-meta-cache", 13) == 0) {
+         instance->meta_cache_enabled = false;
       } else if (strncmp(pipeline_cache_str, "off", 3) == 0) {
          instance->pipeline_cache_enabled = false;
          instance->default_pipeline_cache_enabled = false;
+         instance->meta_cache_enabled = false;
       } else {
          fprintf(stderr, "Wrong value for envvar V3DV_ENABLE_PIPELINE_CACHE. "
-                 "Allowed values are: full, no-default-cache, off\n");
+                 "Allowed values are: full, no-default-cache, no-meta-cache, off\n");
       }
    }
 
    if (instance->pipeline_cache_enabled == false) {
       fprintf(stderr, "WARNING: v3dv pipeline cache is disabled. Performance "
               "can be affected negatively\n");
-   } else {
-      if (instance->default_pipeline_cache_enabled == false) {
-        fprintf(stderr, "WARNING: default v3dv pipeline cache is disabled. "
-                "Performance can be affected negatively\n");
-      }
    }
+   if (instance->default_pipeline_cache_enabled == false) {
+      fprintf(stderr, "WARNING: default v3dv pipeline cache is disabled. "
+              "Performance can be affected negatively\n");
+   }
+   if (instance->meta_cache_enabled == false) {
+      fprintf(stderr, "WARNING: custom pipeline cache for meta operations are disabled. "
+              "Performance can be affected negatively\n");
+   }
+
 
    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
@@ -818,6 +833,8 @@ get_device_properties(const struct v3dv_physical_device *device,
 
    const uint32_t max_varying_components = 16 * 4;
 
+   const uint32_t max_per_stage_resources = 128;
+
    const float v3d_point_line_granularity = 2.0f / (1 << V3D_COORD_SHIFT);
    const uint32_t max_fb_size = V3D_MAX_IMAGE_DIMENSION;
 
@@ -897,26 +914,27 @@ get_device_properties(const struct v3dv_physical_device *device,
       .maxPerStageDescriptorSampledImages = MAX_SAMPLED_IMAGES,
       .maxPerStageDescriptorStorageImages = MAX_STORAGE_IMAGES,
       .maxPerStageDescriptorInputAttachments = MAX_INPUT_ATTACHMENTS,
-      .maxPerStageResources = 128,
+      .maxPerStageResources = max_per_stage_resources,
 
-      /* Some of these limits are multiplied by 6 because they need to
-       * include all possible shader stages (even if not supported). See
-       * 'Required Limits' table in the Vulkan spec.
-       */
-      .maxDescriptorSetSamplers = 6 * V3D_MAX_TEXTURE_SAMPLERS,
-      .maxDescriptorSetUniformBuffers = 6 * MAX_UNIFORM_BUFFERS,
+      .maxDescriptorSetSamplers =
+          V3DV_SUPPORTED_SHADER_STAGES * V3D_MAX_TEXTURE_SAMPLERS,
+      .maxDescriptorSetUniformBuffers =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_UNIFORM_BUFFERS,
       .maxDescriptorSetUniformBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS,
-      .maxDescriptorSetStorageBuffers = 6 * MAX_STORAGE_BUFFERS,
+      .maxDescriptorSetStorageBuffers =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_STORAGE_BUFFERS,
       .maxDescriptorSetStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS,
-      .maxDescriptorSetSampledImages = 6 * MAX_SAMPLED_IMAGES,
-      .maxDescriptorSetStorageImages = 6 * MAX_STORAGE_IMAGES,
+      .maxDescriptorSetSampledImages =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_SAMPLED_IMAGES,
+      .maxDescriptorSetStorageImages =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_STORAGE_IMAGES,
       .maxDescriptorSetInputAttachments = MAX_INPUT_ATTACHMENTS,
 
       /* Vertex limits */
       .maxVertexInputAttributes                 = MAX_VERTEX_ATTRIBS,
       .maxVertexInputBindings                   = MAX_VBS,
       .maxVertexInputAttributeOffset            = 0xffffffff,
-      .maxVertexInputBindingStride              = 0xffffffff,
+      .maxVertexInputBindingStride              = MESA_VK_MAX_VERTEX_BINDING_STRIDE,
       .maxVertexOutputComponents                = max_varying_components,
 
       /* Tessellation limits */
@@ -1074,6 +1092,27 @@ get_device_properties(const struct v3dv_physical_device *device,
       .shaderRoundingModeRTZFloat32 = false,
       .shaderRoundingModeRTZFloat64 = false,
 
+      .maxPerStageDescriptorUpdateAfterBindSamplers = V3D_MAX_TEXTURE_SAMPLERS,
+      .maxPerStageDescriptorUpdateAfterBindUniformBuffers = MAX_UNIFORM_BUFFERS,
+      .maxPerStageDescriptorUpdateAfterBindStorageBuffers = MAX_STORAGE_BUFFERS,
+      .maxPerStageDescriptorUpdateAfterBindSampledImages = MAX_SAMPLED_IMAGES,
+      .maxPerStageDescriptorUpdateAfterBindStorageImages = MAX_STORAGE_IMAGES,
+      .maxPerStageDescriptorUpdateAfterBindInputAttachments = MAX_INPUT_ATTACHMENTS,
+      .maxPerStageUpdateAfterBindResources = max_per_stage_resources,
+      .maxDescriptorSetUpdateAfterBindSamplers =
+          V3DV_SUPPORTED_SHADER_STAGES * V3D_MAX_TEXTURE_SAMPLERS,
+      .maxDescriptorSetUpdateAfterBindUniformBuffers =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_UNIFORM_BUFFERS,
+      .maxDescriptorSetUpdateAfterBindUniformBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS,
+      .maxDescriptorSetUpdateAfterBindStorageBuffers =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_STORAGE_BUFFERS,
+      .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS,
+      .maxDescriptorSetUpdateAfterBindSampledImages =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_SAMPLED_IMAGES,
+      .maxDescriptorSetUpdateAfterBindStorageImages =
+          V3DV_SUPPORTED_SHADER_STAGES * MAX_STORAGE_IMAGES,
+      .maxDescriptorSetUpdateAfterBindInputAttachments = MAX_INPUT_ATTACHMENTS,
+
       /* V3D doesn't support min/max filtering */
       .filterMinmaxSingleComponentFormats = false,
       .filterMinmaxImageComponentMapping = false,
@@ -1180,6 +1219,14 @@ get_device_properties(const struct v3dv_physical_device *device,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
 
       .subgroupSupportedOperations = subgroup_ops,
+
+      /* VK_KHR_maintenance5 */
+      .earlyFragmentMultisampleCoverageAfterSampleCounting = true,
+      .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
+      .depthStencilSwizzleOneSupport = true,
+      .polygonModePointSize = true,
+      .nonStrictSinglePixelWideLinesUseParallelogram = true,
+      .nonStrictWideLinesUseParallelogram = true,
    };
 
    /* VkPhysicalDeviceShaderModuleIdentifierPropertiesEXT */
@@ -1347,10 +1394,11 @@ create_physical_device(struct v3dv_instance *instance,
    device->next_program_id = 0;
 
    ASSERTED int len =
-      asprintf(&device->name, "V3D %d.%d.%d",
+      asprintf(&device->name, "V3D %d.%d.%d.%d",
                device->devinfo.ver / 10,
                device->devinfo.ver % 10,
-               device->devinfo.rev);
+               device->devinfo.rev,
+               device->devinfo.compat_rev);
    assert(len != -1);
 
    v3dv_physical_device_init_disk_cache(device);
@@ -1395,15 +1443,15 @@ create_physical_device(struct v3dv_instance *instance,
    device->sync_types[2] = NULL;
    device->vk.supported_sync_types = device->sync_types;
 
+   get_device_extensions(device, &device->vk.supported_extensions);
+   get_features(device, &device->vk.supported_features);
+   get_device_properties(device, &device->vk.properties);
+
    result = v3dv_wsi_init(device);
    if (result != VK_SUCCESS) {
       vk_error(instance, result);
       goto fail;
    }
-
-   get_device_extensions(device, &device->vk.supported_extensions);
-   get_features(device, &device->vk.supported_features);
-   get_device_properties(device, &device->vk.properties);
 
    mtx_init(&device->mutex, mtx_plain);
 
@@ -1607,7 +1655,7 @@ v3dv_GetInstanceProcAddr(VkInstance _instance,
                          const char *pName)
 {
    V3DV_FROM_HANDLE(v3dv_instance, instance, _instance);
-   return vk_instance_get_proc_addr(&instance->vk,
+   return vk_instance_get_proc_addr(instance ? &instance->vk : NULL,
                                     &v3dv_instance_entrypoints,
                                     pName);
 }
@@ -2486,8 +2534,17 @@ v3dv_buffer_init(struct v3dv_device *device,
                  struct v3dv_buffer *buffer,
                  uint32_t alignment)
 {
+   const VkBufferUsageFlags2CreateInfoKHR *flags2 =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR);
+   VkBufferUsageFlags2KHR usage;
+   if (flags2)
+      usage = flags2->usage;
+   else
+      usage = pCreateInfo->usage;
+
    buffer->size = pCreateInfo->size;
-   buffer->usage = pCreateInfo->usage;
+   buffer->usage = usage;
    buffer->alignment = alignment;
 }
 

@@ -1,5 +1,4 @@
 # Copyright © 2017 Intel Corporation
-#
 # SPDX-License-Identifier: MIT
 
 radv_entrypoints_gen_command = [
@@ -182,7 +181,7 @@ if not with_platform_windows
   )
 endif
 
-if with_llvm
+if amd_with_llvm
   libradv_files += files(
     'radv_llvm_helper.cpp',
     'radv_llvm_helper.h',

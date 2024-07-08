@@ -337,7 +337,6 @@ inst_uses_src_acc(const struct brw_isa_info *isa,
    switch (brw_inst_opcode(isa, inst)) {
    case BRW_OPCODE_MAC:
    case BRW_OPCODE_MACH:
-   case BRW_OPCODE_SADA2:
       return true;
    default:
       break;
@@ -2104,8 +2103,10 @@ instruction_restrictions(const struct brw_isa_info *isa,
          ERROR_IF(dst_type != BRW_TYPE_F &&
                   dst_type != BRW_TYPE_HF &&
                   dst_type != BRW_TYPE_D &&
-                  dst_type != BRW_TYPE_W,
-                  "CSEL destination type must be F, HF, D, or W");
+                  dst_type != BRW_TYPE_W &&
+                  dst_type != BRW_TYPE_UD &&
+                  dst_type != BRW_TYPE_UW,
+                  "CSEL destination type must be F, HF, *D, or *W");
       }
 
       for (unsigned s = 0; s < 3; s++) {

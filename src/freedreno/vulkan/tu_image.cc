@@ -17,11 +17,14 @@
 #include "vk_android.h"
 #include "vk_util.h"
 #include "drm-uapi/drm_fourcc.h"
+#include "vulkan/vulkan_core.h"
 
+#include "tu_buffer.h"
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_formats.h"
+#include "tu_lrz.h"
 #include "tu_rmv.h"
 #include "tu_wsi.h"
 
@@ -172,12 +175,21 @@ tu_image_view_init(struct tu_device *device,
    const VkImageSubresourceRange *range = &pCreateInfo->subresourceRange;
    VkFormat vk_format =
       vk_select_android_external_format(pCreateInfo->pNext, pCreateInfo->format);
+
+   /* With AHB, the app may be using an external format but not necessarily
+    * chain the VkExternalFormatANDROID.  In this case, just take the format
+    * from the image.
+    */
+   if ((vk_format == VK_FORMAT_UNDEFINED) &&
+       (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID))
+       vk_format = image->vk.format;
+
    VkImageAspectFlags aspect_mask = pCreateInfo->subresourceRange.aspectMask;
 
    const struct VkSamplerYcbcrConversionInfo *ycbcr_conversion =
       vk_find_struct_const(pCreateInfo->pNext, SAMPLER_YCBCR_CONVERSION_INFO);
-   const struct tu_sampler_ycbcr_conversion *conversion = ycbcr_conversion ?
-      tu_sampler_ycbcr_conversion_from_handle(ycbcr_conversion->conversion) : NULL;
+   const struct vk_ycbcr_conversion *conversion = ycbcr_conversion ?
+      vk_ycbcr_conversion_from_handle(ycbcr_conversion->conversion) : NULL;
 
    vk_image_view_init(&device->vk, &iview->vk, false, pCreateInfo);
 
@@ -229,8 +241,14 @@ tu_image_view_init(struct tu_device *device,
    if (conversion) {
       unsigned char conversion_swiz[4], create_swiz[4];
       memcpy(create_swiz, args.swiz, sizeof(create_swiz));
-      vk_component_mapping_to_pipe_swizzle(conversion->components,
-                                           conversion_swiz);
+
+      VkComponentMapping component = {
+         .r = conversion->state.mapping[0],
+         .g = conversion->state.mapping[1],
+         .b = conversion->state.mapping[2],
+         .a = conversion->state.mapping[3]
+      };
+      vk_component_mapping_to_pipe_swizzle(component, conversion_swiz);
       util_format_compose_swizzles(create_swiz, conversion_swiz, args.swiz);
    }
 
@@ -257,8 +275,8 @@ tu_image_view_init(struct tu_device *device,
    STATIC_ASSERT((unsigned)VK_CHROMA_LOCATION_COSITED_EVEN == (unsigned)FDL_CHROMA_LOCATION_COSITED_EVEN);
    STATIC_ASSERT((unsigned)VK_CHROMA_LOCATION_MIDPOINT == (unsigned)FDL_CHROMA_LOCATION_MIDPOINT);
    if (conversion) {
-      args.chroma_offsets[0] = (enum fdl_chroma_location) conversion->chroma_offsets[0];
-      args.chroma_offsets[1] = (enum fdl_chroma_location) conversion->chroma_offsets[1];
+      args.chroma_offsets[0] = (enum fdl_chroma_location) conversion->state.chroma_offsets[0];
+      args.chroma_offsets[1] = (enum fdl_chroma_location) conversion->state.chroma_offsets[1];
    }
 
    fdl6_view_init(&iview->view, layouts, &args, has_z24uint_s8uint);
@@ -431,6 +449,7 @@ format_list_has_swaps(const VkImageFormatListCreateInfo *fmt_list)
    return false;
 }
 
+template <chip CHIP>
 VkResult
 tu_image_update_layout(struct tu_device *device, struct tu_image *image,
                        uint64_t modifier, const VkSubresourceLayout *plane_layouts)
@@ -563,41 +582,33 @@ tu_image_update_layout(struct tu_device *device, struct tu_image *image,
       image->lrz_height = lrz_height;
       image->lrz_pitch = lrz_pitch;
       image->lrz_offset = image->total_size;
-      unsigned lrz_size = lrz_pitch * lrz_height * 2;
-      image->total_size += lrz_size;
+      unsigned lrz_size = lrz_pitch * lrz_height * sizeof(uint16_t);
 
       unsigned nblocksx = DIV_ROUND_UP(DIV_ROUND_UP(width, 8), 16);
       unsigned nblocksy = DIV_ROUND_UP(DIV_ROUND_UP(height, 8), 4);
 
       /* Fast-clear buffer is 1bit/block */
-      image->lrz_fc_size = DIV_ROUND_UP(nblocksx * nblocksy, 8);
+      unsigned lrz_fc_size = DIV_ROUND_UP(nblocksx * nblocksy, 8);
 
-      /* Fast-clear buffer cannot be larger than 512 bytes (HW limitation) */
-      bool has_lrz_fc = image->lrz_fc_size <= 512 &&
+      /* Fast-clear buffer cannot be larger than 512 bytes on A6XX and 1024 bytes on A7XX (HW limitation) */
+      image->has_lrz_fc =
          device->physical_device->info->a6xx.enable_lrz_fast_clear &&
+         lrz_fc_size <= tu_lrzfc_layout<CHIP>::FC_SIZE &&
          !TU_DEBUG(NOLRZFC);
 
-      if (has_lrz_fc || device->physical_device->info->a6xx.has_lrz_dir_tracking) {
-         image->lrz_fc_offset = image->total_size;
-         image->total_size += 512;
-
-         if (device->physical_device->info->a6xx.has_lrz_dir_tracking) {
-            /* Direction tracking uses 1 byte */
-            image->total_size += 1;
-            /* GRAS_LRZ_DEPTH_VIEW needs 5 bytes: 4 for view data and 1 for padding */
-            image->total_size += 5;
-         }
+      if (image->has_lrz_fc || device->physical_device->info->a6xx.has_lrz_dir_tracking) {
+         image->lrz_fc_offset = image->total_size + lrz_size;
+         lrz_size += sizeof(tu_lrzfc_layout<CHIP>);
       }
 
-      if (!has_lrz_fc) {
-         image->lrz_fc_size = 0;
-      }
+      image->total_size += lrz_size;
    } else {
       image->lrz_height = 0;
    }
 
    return VK_SUCCESS;
 }
+TU_GENX(tu_image_update_layout);
 
 static VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
@@ -776,8 +787,8 @@ tu_CreateImage(VkDevice _device,
       return VK_SUCCESS;
    }
 
-   result = tu_image_update_layout(device, image, modifier,
-                                   plane_layouts);
+   result = TU_CALLX(device, tu_image_update_layout)(device, image, modifier,
+                                                    plane_layouts);
    if (result != VK_SUCCESS)
       goto fail;
 
@@ -851,6 +862,11 @@ tu_BindImageMemory2(VkDevice _device,
       }
 #endif
 
+      const VkBindMemoryStatusKHR *status =
+         vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
+      if (status)
+         *status->pResult = VK_SUCCESS;
+
       if (mem) {
          VkResult result;
          if (vk_image_is_android_hardware_buffer(&image->vk)) {
@@ -859,12 +875,19 @@ tu_BindImageMemory2(VkDevice _device,
             result = vk_android_get_ahb_layout(mem->vk.ahardware_buffer,
                                             &eci, a_plane_layouts,
                                             TU_MAX_PLANE_COUNT);
-            if (result != VK_SUCCESS)
+            if (result != VK_SUCCESS) {
+               if (status)
+                  *status->pResult = result;
                return result;
+            }
 
-            result = tu_image_update_layout(device, image, eci.drmFormatModifier, a_plane_layouts);
-            if (result != VK_SUCCESS)
+            result = TU_CALLX(device, tu_image_update_layout)(device, image,
+                                                              eci.drmFormatModifier, a_plane_layouts);
+            if (result != VK_SUCCESS) {
+               if (status)
+                  *status->pResult = result;
                return result;
+            }
          }
          image->bo = mem->bo;
          image->iova = mem->bo->iova + pBindInfos[i].memoryOffset;
@@ -872,8 +895,11 @@ tu_BindImageMemory2(VkDevice _device,
          if (image->vk.usage & VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT) {
             if (!mem->bo->map) {
                result = tu_bo_map(device, mem->bo, NULL);
-               if (result != VK_SUCCESS)
+               if (result != VK_SUCCESS) {
+                  if (status)
+                     *status->pResult = result;
                   return result;
+               }
             }
 
             image->map = (char *)mem->bo->map + pBindInfos[i].memoryOffset;
@@ -954,7 +980,7 @@ tu_GetDeviceImageMemoryRequirements(
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
    tu_image_init(device, &image, pInfo->pCreateInfo);
-   tu_image_update_layout(device, &image, DRM_FORMAT_MOD_INVALID, NULL);
+   TU_CALLX(device, tu_image_update_layout)(device, &image, DRM_FORMAT_MOD_INVALID, NULL);
 
    tu_get_image_memory_requirements(device, &image, pMemoryRequirements);
 }
@@ -1020,7 +1046,7 @@ tu_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
    tu_image_init(device, &image, pInfo->pCreateInfo);
-   tu_image_update_layout(device, &image, DRM_FORMAT_MOD_INVALID, NULL);
+   TU_CALLX(device, tu_image_update_layout)(device, &image, DRM_FORMAT_MOD_INVALID, NULL);
 
    tu_get_image_subresource_layout(&image, pInfo->pSubresource, pLayout);
 }
@@ -1058,60 +1084,6 @@ tu_DestroyImageView(VkDevice _device,
       return;
 
    vk_object_free(&device->vk, pAllocator, iview);
-}
-
-void
-tu_buffer_view_init(struct tu_buffer_view *view,
-                    struct tu_device *device,
-                    const VkBufferViewCreateInfo *pCreateInfo)
-{
-   VK_FROM_HANDLE(tu_buffer, buffer, pCreateInfo->buffer);
-
-   view->buffer = buffer;
-
-   uint32_t range = vk_buffer_range(&buffer->vk, pCreateInfo->offset,
-         pCreateInfo->range);
-   uint8_t swiz[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z,
-                       PIPE_SWIZZLE_W };
-
-   fdl6_buffer_view_init(
-      view->descriptor, tu_vk_format_to_pipe_format(pCreateInfo->format),
-      swiz, buffer->iova + pCreateInfo->offset, range);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-tu_CreateBufferView(VkDevice _device,
-                    const VkBufferViewCreateInfo *pCreateInfo,
-                    const VkAllocationCallbacks *pAllocator,
-                    VkBufferView *pView)
-{
-   VK_FROM_HANDLE(tu_device, device, _device);
-   struct tu_buffer_view *view;
-
-   view = (struct tu_buffer_view *) vk_object_alloc(
-      &device->vk, pAllocator, sizeof(*view), VK_OBJECT_TYPE_BUFFER_VIEW);
-   if (!view)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   tu_buffer_view_init(view, device, pCreateInfo);
-
-   *pView = tu_buffer_view_to_handle(view);
-
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-tu_DestroyBufferView(VkDevice _device,
-                     VkBufferView bufferView,
-                     const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(tu_device, device, _device);
-   VK_FROM_HANDLE(tu_buffer_view, view, bufferView);
-
-   if (!view)
-      return;
-
-   vk_object_free(&device->vk, pAllocator, view);
 }
 
 /* Impelements the operations described in "Fragment Density Map Operations."

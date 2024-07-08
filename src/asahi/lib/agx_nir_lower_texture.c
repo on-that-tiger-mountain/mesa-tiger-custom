@@ -12,6 +12,7 @@
 #include "agx_nir_passes.h"
 #include "glsl_types.h"
 #include "libagx_shaders.h"
+#include "nir_builder_opcodes.h"
 #include "nir_builtin_builder.h"
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
@@ -113,8 +114,8 @@ lower_tex_crawl(nir_builder *b, nir_instr *instr, UNUSED void *data)
 static nir_def *
 coords_for_buffer_texture(nir_builder *b, nir_def *coord)
 {
-   return nir_vec2(b, nir_iand_imm(b, coord, BITFIELD_MASK(10)),
-                   nir_ushr_imm(b, coord, 10));
+   return nir_vec2(b, nir_umod_imm(b, coord, AGX_TEXTURE_BUFFER_WIDTH),
+                   nir_udiv_imm(b, coord, AGX_TEXTURE_BUFFER_WIDTH));
 }
 
 /*
@@ -134,23 +135,21 @@ lower_buffer_texture(nir_builder *b, nir_tex_instr *tex)
 {
    nir_def *coord = nir_steal_tex_src(tex, nir_tex_src_coord);
 
-   /* The OpenGL ES 3.2 specification says on page 187:
-    *
-    *    When a buffer texture is accessed in a shader, the results of a texel
-    *    fetch are undefined if the specified texel coordinate is negative, or
-    *    greater than or equal to the clamped number of texels in the texture
-    *    image.
-    *
-    * However, faulting would be undesirable for robustness, so clamp.
+   /* Map out-of-bounds indices to out-of-bounds coordinates for robustness2
+    * semantics from the hardware.
     */
    nir_def *size = nir_get_texture_size(b, tex);
-   coord = nir_umin(b, coord, nir_iadd_imm(b, size, -1));
+   nir_def *oob = nir_uge(b, coord, size);
+   coord = nir_bcsel(b, oob, nir_imm_int(b, -1), coord);
 
    nir_def *desc = texture_descriptor_ptr(b, tex);
    bool is_float = nir_alu_type_get_base_type(tex->dest_type) == nir_type_float;
 
-   /* Lower RGB32 reads if the format requires */
-   nir_if *nif = nir_push_if(b, libagx_texture_is_rgb32(b, desc));
+   /* Lower RGB32 reads if the format requires. If we are out-of-bounds, we use
+    * the hardware path so we get a zero texel.
+    */
+   nir_if *nif = nir_push_if(
+      b, nir_iand(b, libagx_texture_is_rgb32(b, desc), nir_inot(b, oob)));
 
    nir_def *rgb32 = nir_trim_vector(
       b, libagx_texture_load_rgb32(b, desc, coord, nir_imm_bool(b, is_float)),
@@ -326,14 +325,8 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, UNUSED void *data)
 static nir_def *
 bias_for_tex(nir_builder *b, nir_tex_instr *tex)
 {
-   nir_instr *instr = nir_get_texture_size(b, tex)->parent_instr;
-   nir_tex_instr *query = nir_instr_as_tex(instr);
-
-   query->op = nir_texop_lod_bias_agx;
-   query->dest_type = nir_type_float16;
-
-   nir_def_init(instr, &query->def, 1, 16);
-   return &query->def;
+   return nir_build_texture_query(b, tex, nir_texop_lod_bias_agx, 1,
+                                  nir_type_float16, false, false);
 }
 
 static bool
@@ -630,6 +623,64 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 }
 
 /*
+ * Map out-of-bounds storage texel buffer accesses and multisampled image stores
+ * to -1 indices, which will become an out-of-bounds hardware access. This gives
+ * cheap robustness2.
+ */
+static bool
+lower_robustness(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+      break;
+   default:
+      return false;
+   }
+
+   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   bool array = nir_intrinsic_image_array(intr);
+   unsigned size_components = nir_image_intrinsic_coord_components(intr);
+
+   nir_def *deref = intr->src[0].ssa;
+   nir_def *coord = intr->src[1].ssa;
+
+   if (dim != GLSL_SAMPLER_DIM_BUF &&
+       !(dim == GLSL_SAMPLER_DIM_MS &&
+         intr->intrinsic == nir_intrinsic_image_deref_store))
+      return false;
+
+   /* Bounds check the coordinate */
+   nir_def *size =
+      nir_image_deref_size(b, size_components, 32, deref, nir_imm_int(b, 0),
+                           .image_dim = dim, .image_array = array);
+   nir_def *oob = nir_bany(b, nir_uge(b, coord, size));
+
+   /* Bounds check the sample */
+   if (dim == GLSL_SAMPLER_DIM_MS) {
+      nir_def *samples = nir_image_deref_samples(b, 32, deref, .image_dim = dim,
+                                                 .image_array = array);
+
+      oob = nir_ior(b, oob, nir_uge(b, intr->src[2].ssa, samples));
+   }
+
+   /* Replace the last coordinate component with a large coordinate for
+    * out-of-bounds. We pick 65535 as it fits in 16-bit, and it is not signed as
+    * 32-bit so we won't get in-bounds coordinates for arrays due to two's
+    * complement wraparound. This ensures the resulting hardware coordinate is
+    * definitely out-of-bounds, giving hardware-level robustness2 behaviour.
+    */
+   unsigned c = size_components - 1;
+   nir_def *r =
+      nir_bcsel(b, oob, nir_imm_int(b, 65535), nir_channel(b, coord, c));
+
+   nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, r, c));
+   return true;
+}
+
+/*
  * Early texture lowering passes, called by the driver before lowering
  * descriptor bindings. That means these passes operate on texture derefs. The
  * purpose is to make descriptor crawls explicit in the NIR, so that the driver
@@ -640,6 +691,9 @@ bool
 agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias)
 {
    bool progress = false;
+
+   NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_robustness,
+            nir_metadata_control_flow, NULL);
 
    nir_lower_tex_options lower_tex_options = {
       .lower_txp = ~0,
@@ -663,7 +717,7 @@ agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias)
     */
    if (support_lod_bias) {
       NIR_PASS(progress, s, nir_shader_instructions_pass, lower_sampler_bias,
-               nir_metadata_block_index | nir_metadata_dominance, NULL);
+               nir_metadata_control_flow, NULL);
    }
 
    return progress;
@@ -686,14 +740,14 @@ agx_nir_lower_texture(nir_shader *s)
     * different fencing than other image operations.
     */
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, fence_image,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
 
    NIR_PASS(progress, s, nir_lower_image_atomics_to_global);
 
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, legalize_image_lod,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_images,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
    NIR_PASS(progress, s, nir_legalize_16bit_sampler_srcs, tex_constraints);
 
    /* Fold constants after nir_legalize_16bit_sampler_srcs so we can detect 0 in
@@ -708,7 +762,7 @@ agx_nir_lower_texture(nir_shader *s)
    NIR_PASS(progress, s, nir_shader_instructions_pass, lower_regular_texture,
             nir_metadata_none, NULL);
    NIR_PASS(progress, s, nir_shader_instructions_pass, lower_tex_crawl,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
 
    return progress;
 }
@@ -738,9 +792,8 @@ lower_multisampled_store(nir_builder *b, nir_intrinsic_instr *intr,
 bool
 agx_nir_lower_multisampled_image_store(nir_shader *s)
 {
-   return nir_shader_intrinsics_pass(
-      s, lower_multisampled_store,
-      nir_metadata_block_index | nir_metadata_dominance, NULL);
+   return nir_shader_intrinsics_pass(s, lower_multisampled_store,
+                                     nir_metadata_control_flow, NULL);
 }
 
 /*

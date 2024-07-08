@@ -161,9 +161,10 @@ v3d_predraw_check_stage_inputs(struct pipe_context *pctx,
                                enum pipe_shader_type s)
 {
         struct v3d_context *v3d = v3d_context(pctx);
+        unsigned i;
 
         /* Flush writes to textures we're sampling. */
-        for (int i = 0; i < v3d->tex[s].num_textures; i++) {
+        for (i = 0; i < v3d->tex[s].num_textures; i++) {
                 struct pipe_sampler_view *pview = v3d->tex[s].textures[i];
                 if (!pview)
                         continue;
@@ -179,7 +180,8 @@ v3d_predraw_check_stage_inputs(struct pipe_context *pctx,
         }
 
         /* Flush writes to UBOs. */
-        u_foreach_bit(i, v3d->constbuf[s].enabled_mask) {
+        BITSET_FOREACH_SET(i, v3d->constbuf[s].enabled_mask,
+                           PIPE_MAX_CONSTANT_BUFFERS) {
                 struct pipe_constant_buffer *cb = &v3d->constbuf[s].cb[i];
                 if (cb->buffer) {
                         v3d_flush_jobs_writing_resource(v3d, cb->buffer,
@@ -189,7 +191,8 @@ v3d_predraw_check_stage_inputs(struct pipe_context *pctx,
         }
 
         /* Flush reads/writes to our SSBOs */
-        u_foreach_bit(i, v3d->ssbo[s].enabled_mask) {
+        BITSET_FOREACH_SET(i, v3d->ssbo[s].enabled_mask,
+                           PIPE_MAX_SHADER_BUFFERS) {
                 struct pipe_shader_buffer *sb = &v3d->ssbo[s].sb[i];
                 if (sb->buffer) {
                         v3d_flush_jobs_reading_resource(v3d, sb->buffer,
@@ -199,7 +202,8 @@ v3d_predraw_check_stage_inputs(struct pipe_context *pctx,
         }
 
         /* Flush reads/writes to our image views */
-        u_foreach_bit(i, v3d->shaderimg[s].enabled_mask) {
+        BITSET_FOREACH_SET(i, v3d->shaderimg[s].enabled_mask,
+                           PIPE_MAX_SHADER_IMAGES) {
                 struct v3d_image_view *view = &v3d->shaderimg[s].si[i];
 
                 v3d_flush_jobs_reading_resource(v3d, view->base.resource,
@@ -209,7 +213,8 @@ v3d_predraw_check_stage_inputs(struct pipe_context *pctx,
 
         /* Flush writes to our vertex buffers (i.e. from transform feedback) */
         if (s == PIPE_SHADER_VERTEX) {
-                u_foreach_bit(i, v3d->vertexbuf.enabled_mask) {
+                BITSET_FOREACH_SET(i, v3d->vertexbuf.enabled_mask,
+                                   PIPE_MAX_ATTRIBS) {
                         struct pipe_vertex_buffer *vb = &v3d->vertexbuf.vb[i];
 
                         v3d_flush_jobs_writing_resource(v3d, vb->buffer.resource,
@@ -251,10 +256,12 @@ v3d_state_reads_resource(struct v3d_context *v3d,
                          enum pipe_shader_type s)
 {
         struct v3d_resource *rsc = v3d_resource(prsc);
+        unsigned i;
 
         /* Vertex buffers */
         if (s == PIPE_SHADER_VERTEX) {
-                u_foreach_bit(i, v3d->vertexbuf.enabled_mask) {
+                BITSET_FOREACH_SET(i, v3d->vertexbuf.enabled_mask,
+                                   PIPE_MAX_ATTRIBS) {
                         struct pipe_vertex_buffer *vb = &v3d->vertexbuf.vb[i];
                         if (!vb->buffer.resource)
                                 continue;
@@ -267,7 +274,8 @@ v3d_state_reads_resource(struct v3d_context *v3d,
         }
 
         /* Constant buffers */
-        u_foreach_bit(i, v3d->constbuf[s].enabled_mask) {
+        BITSET_FOREACH_SET(i, v3d->constbuf[s].enabled_mask,
+                           PIPE_MAX_CONSTANT_BUFFERS) {
                 struct pipe_constant_buffer *cb = &v3d->constbuf[s].cb[i];
                 if (!cb->buffer)
                         continue;
@@ -278,7 +286,8 @@ v3d_state_reads_resource(struct v3d_context *v3d,
         }
 
         /* Shader storage buffers */
-        u_foreach_bit(i, v3d->ssbo[s].enabled_mask) {
+        BITSET_FOREACH_SET(i, v3d->ssbo[s].enabled_mask,
+                           PIPE_MAX_SHADER_BUFFERS) {
                 struct pipe_shader_buffer *sb = &v3d->ssbo[s].sb[i];
                 if (!sb->buffer)
                         continue;
@@ -1145,7 +1154,9 @@ v3d_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          * which ones are read vs written, so just assume the worst.
          */
         for (int s = 0; s < PIPE_SHADER_COMPUTE; s++) {
-                u_foreach_bit(i, v3d->ssbo[s].enabled_mask) {
+                unsigned i;
+                BITSET_FOREACH_SET(i, v3d->ssbo[s].enabled_mask,
+                                   PIPE_MAX_SHADER_BUFFERS) {
                         v3d_job_add_write_resource(job,
                                                    v3d->ssbo[s].sb[i].buffer);
                         struct v3d_resource *rsc= v3d_resource(v3d->ssbo[s].sb[i].buffer);
@@ -1153,7 +1164,8 @@ v3d_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
                         job->tmu_dirty_rcl = true;
                 }
 
-                u_foreach_bit(i, v3d->shaderimg[s].enabled_mask) {
+                BITSET_FOREACH_SET(i, v3d->shaderimg[s].enabled_mask,
+                                   PIPE_MAX_SHADER_IMAGES) {
                         v3d_job_add_write_resource(job,
                                                    v3d->shaderimg[s].si[i].base.resource);
                         struct v3d_resource *rsc= v3d_resource(v3d->shaderimg[s].si[i].base.resource);
@@ -1399,6 +1411,7 @@ v3d_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 {
         struct v3d_context *v3d = v3d_context(pctx);
         struct v3d_screen *screen = v3d->screen;
+        unsigned i;
 
         v3d_predraw_check_stage_inputs(pctx, PIPE_SHADER_COMPUTE);
 
@@ -1459,12 +1472,13 @@ v3d_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
         }
 
         uint32_t num_wgs = 1;
-        for (int i = 0; i < 3; i++) {
+        for (i = 0; i < 3; i++) {
                 num_wgs *= v3d->compute_num_workgroups[i];
                 submit.cfg[i] |= (v3d->compute_num_workgroups[i] <<
                                   V3D_CSD_CFG012_WG_COUNT_SHIFT);
         }
 
+        memcpy(v3d->compute_workgroup_size, info->block, 3 * sizeof(uint32_t));
         uint32_t wg_size = info->block[0] * info->block[1] * info->block[2];
 
         struct v3d_compute_prog_data *compute =
@@ -1512,12 +1526,21 @@ v3d_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
         if (v3d->prog.compute->prog_data.base->threads == 4)
                 submit.cfg[5] |= V3D_CSD_CFG5_THREADING;
 
-        if (v3d->prog.compute->prog_data.compute->shared_size) {
+        uint32_t shared_size = v3d->prog.compute->prog_data.compute->shared_size +
+                               info->variable_shared_mem;
+        if (shared_size) {
                 v3d->compute_shared_memory =
                         v3d_bo_alloc(v3d->screen,
-                                     v3d->prog.compute->prog_data.compute->shared_size *
-                                     num_wgs,
+                                     shared_size * num_wgs,
                                      "shared_vars");
+                v3d->shared_memory = shared_size;
+        }
+
+        util_dynarray_foreach(&v3d->global_buffers, struct pipe_resource *, res) {
+                if (!*res)
+                        continue;
+                struct v3d_resource *rsc = v3d_resource(*res);
+                v3d_job_add_bo(job, rsc->bo);
         }
 
         struct v3d_cl_reloc uniforms = v3d_write_uniforms(v3d, job,
@@ -1562,16 +1585,27 @@ v3d_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
         /* Mark SSBOs as being written.. we don't actually know which ones are
          * read vs written, so just assume the worst
          */
-        u_foreach_bit(i, v3d->ssbo[PIPE_SHADER_COMPUTE].enabled_mask) {
+        BITSET_FOREACH_SET(i, v3d->ssbo[PIPE_SHADER_COMPUTE].enabled_mask,
+                           PIPE_MAX_SHADER_BUFFERS) {
                 struct v3d_resource *rsc = v3d_resource(
                         v3d->ssbo[PIPE_SHADER_COMPUTE].sb[i].buffer);
                 rsc->writes++;
                 rsc->compute_written = true;
         }
 
-        u_foreach_bit(i, v3d->shaderimg[PIPE_SHADER_COMPUTE].enabled_mask) {
+        BITSET_FOREACH_SET(i,
+                           v3d->shaderimg[PIPE_SHADER_COMPUTE].enabled_mask,
+                           PIPE_MAX_SHADER_IMAGES) {
                 struct v3d_resource *rsc = v3d_resource(
                         v3d->shaderimg[PIPE_SHADER_COMPUTE].si[i].base.resource);
+                rsc->writes++;
+                rsc->compute_written = true;
+        }
+
+        util_dynarray_foreach(&v3d->global_buffers, struct pipe_resource *, res) {
+                struct v3d_resource *rsc = v3d_resource(*res);
+                if (!rsc)
+                        continue;
                 rsc->writes++;
                 rsc->compute_written = true;
         }
@@ -1770,6 +1804,39 @@ v3d_clear_depth_stencil(struct pipe_context *pctx, struct pipe_surface *ps,
                                          stencil, x, y, w, h);
 }
 
+static void
+v3d_set_global_binding(struct pipe_context *pctx,
+                       unsigned first, unsigned count,
+                       struct pipe_resource **resources,
+                       uint32_t **handles)
+{
+        struct v3d_context *v3d = v3d_context(pctx);
+        unsigned old_size = util_dynarray_num_elements(&v3d->global_buffers, *resources);
+
+        if (old_size < first + count) {
+                /* we are screwed no matter what */
+                if (!util_dynarray_grow(&v3d->global_buffers, *resources, (first + count) - old_size))
+                        unreachable("out of memory");
+
+                for (unsigned i = old_size; i < first + count; i++)
+                        *util_dynarray_element(&v3d->global_buffers, struct pipe_resource *, i) = NULL;
+        }
+
+
+        for (unsigned i = first; i < first + count; ++i) {
+                struct pipe_resource **res = util_dynarray_element(&v3d->global_buffers, struct pipe_resource *, first + i);
+                if (resources && resources[i]) {
+                        struct v3d_resource *rsc = v3d_resource(resources[i]);
+                        pipe_resource_reference(res, resources[i]);
+
+                        /* We have to add the base address as there might be an existing offset */
+                        *handles[i] += rsc->bo->offset;
+                } else {
+                        pipe_resource_reference(res, NULL);
+                }
+        }
+}
+
 void
 v3dX(draw_init)(struct pipe_context *pctx)
 {
@@ -1777,6 +1844,8 @@ v3dX(draw_init)(struct pipe_context *pctx)
         pctx->clear = v3d_clear;
         pctx->clear_render_target = v3d_clear_render_target;
         pctx->clear_depth_stencil = v3d_clear_depth_stencil;
-        if (v3d_context(pctx)->screen->has_csd)
+        if (v3d_context(pctx)->screen->has_csd) {
                 pctx->launch_grid = v3d_launch_grid;
+                pctx->set_global_binding = v3d_set_global_binding;
+        }
 }

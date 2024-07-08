@@ -236,6 +236,7 @@ bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s);
 
+bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
                                     unsigned nr_distances);
 
@@ -300,4 +301,5 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_doubles_options = (nir_lower_doubles_options)(~0),
    .lower_fquantize2f16 = true,
    .compact_arrays = true,
+   .discard_is_demote = true,
 };

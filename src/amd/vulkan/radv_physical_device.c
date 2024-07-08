@@ -41,7 +41,7 @@ typedef void *drmDevicePtr;
 #include "winsys/null/radv_null_winsys_public.h"
 #include "git_sha1.h"
 
-#if LLVM_AVAILABLE
+#if AMD_LLVM_AVAILABLE
 #include "ac_llvm_util.h"
 #endif
 
@@ -124,13 +124,6 @@ radv_is_conformant(const struct radv_physical_device *pdev)
    return pdev->info.gfx_level >= GFX8;
 }
 
-bool
-radv_device_supports_etc(const struct radv_physical_device *pdev)
-{
-   return pdev->info.family == CHIP_VEGA10 || pdev->info.family == CHIP_RAVEN || pdev->info.family == CHIP_RAVEN2 ||
-          pdev->info.family == CHIP_STONEY;
-}
-
 static void
 parse_hex(char *out, const char *in, unsigned length)
 {
@@ -198,7 +191,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
       return -1;
 #endif
 
-#if LLVM_AVAILABLE
+#if AMD_LLVM_AVAILABLE
    if (pdev->use_llvm && !disk_cache_get_function_identifier(LLVMInitializeAMDGPUTargetInfo, &ctx))
       return -1;
 #endif
@@ -522,6 +515,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_maintenance4 = true,
       .KHR_maintenance5 = true,
       .KHR_maintenance6 = true,
+      .KHR_maintenance7 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
       .KHR_performance_query = radv_perf_query_supported(pdev),
@@ -662,6 +656,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_shader_image_atomic_int64 = true,
       .EXT_shader_module_identifier = true,
       .EXT_shader_object = !pdev->use_llvm && !(instance->debug_flags & RADV_DEBUG_NO_ESO),
+      .EXT_shader_replicated_composites = true,
       .EXT_shader_stencil_export = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
@@ -704,8 +699,8 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .INTEL_shader_integer_functions2 = true,
       .MESA_image_alignment_control = pdev->info.gfx_level >= GFX9 && pdev->info.gfx_level <= GFX11_5,
       .NV_compute_shader_derivatives = true,
-      .NV_device_generated_commands = !pdev->use_llvm && instance->drirc.enable_dgc,
-      .NV_device_generated_commands_compute = !pdev->use_llvm && instance->drirc.enable_dgc,
+      .NV_device_generated_commands = instance->drirc.enable_dgc,
+      .NV_device_generated_commands_compute = instance->drirc.enable_dgc,
       /* Undocumented extension purely for vkd3d-proton. This check is to prevent anyone else from
        * using it.
        */
@@ -748,7 +743,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .alphaToOne = true,
       .multiViewport = true,
       .samplerAnisotropy = true,
-      .textureCompressionETC2 = radv_device_supports_etc(pdev) || pdev->emulate_etc2,
+      .textureCompressionETC2 = pdev->info.has_etc_support || pdev->emulate_etc2,
       .textureCompressionASTC_LDR = pdev->emulate_astc,
       .textureCompressionBC = true,
       .occlusionQueryPrecise = true,
@@ -1223,6 +1218,12 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
 
       /* VK_MESA_image_alignment_control */
       .imageAlignmentControl = true,
+
+      /* VK_EXT_shader_replicated_composites */
+      .shaderReplicatedComposites = true,
+
+      /* VK_KHR_maintenance7 */
+      .maintenance7 = true,
    };
 }
 
@@ -1275,7 +1276,7 @@ radv_get_compiler_string(struct radv_physical_device *pdev)
       return "";
    }
 
-#if LLVM_AVAILABLE
+#if AMD_LLVM_AVAILABLE
    return " (LLVM " MESA_LLVM_VERSION_STRING ")";
 #else
    unreachable("LLVM is not available");
@@ -1927,6 +1928,16 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    p->supportedImageAlignmentMask = (4 * 1024) | (64 * 1024);
    if (gfx11plus)
       p->supportedImageAlignmentMask |= 256 * 1024;
+
+   /* VK_KHR_maintenance7 */
+   p->robustFragmentShadingRateAttachmentAccess = true;
+   p->separateDepthStencilAttachmentAccess = true;
+   p->maxDescriptorSetTotalUniformBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS;
+   p->maxDescriptorSetTotalStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS;
+   p->maxDescriptorSetTotalBuffersDynamic = MAX_DYNAMIC_BUFFERS;
+   p->maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS;
+   p->maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS;
+   p->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = MAX_DYNAMIC_BUFFERS;
 }
 
 static VkResult
@@ -2029,7 +2040,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    pdev->ws->query_info(pdev->ws, &pdev->info);
 
    pdev->use_llvm = instance->debug_flags & RADV_DEBUG_LLVM;
-#if !LLVM_AVAILABLE
+#if !AMD_LLVM_AVAILABLE
    if (pdev->use_llvm) {
       fprintf(stderr, "ERROR: LLVM compiler backend selected for radv, but LLVM support was not "
                       "enabled at build time.\n");
@@ -2038,10 +2049,10 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 #endif
 
 #if DETECT_OS_ANDROID
-   pdev->emulate_etc2 = !radv_device_supports_etc(pdev);
+   pdev->emulate_etc2 = !pdev->info.has_etc_support;
    pdev->emulate_astc = true;
 #else
-   pdev->emulate_etc2 = !radv_device_supports_etc(pdev) && instance->drirc.vk_require_etc2;
+   pdev->emulate_etc2 = !pdev->info.has_etc_support && instance->drirc.vk_require_etc2;
    pdev->emulate_astc = instance->drirc.vk_require_astc;
 #endif
 
@@ -2075,7 +2086,8 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    pdev->emulate_ngg_gs_query_pipeline_stat = pdev->use_ngg && pdev->info.gfx_level < GFX11;
 
    pdev->mesh_fast_launch_2 =
-      pdev->info.gfx_level >= GFX11 && !(instance->debug_flags & RADV_DEBUG_NO_GS_FAST_LAUNCH_2);
+      (pdev->info.gfx_level >= GFX11 && !(instance->debug_flags & RADV_DEBUG_NO_GS_FAST_LAUNCH_2)) ||
+      pdev->info.gfx_level >= GFX12;
 
    pdev->emulate_mesh_shader_queries = pdev->info.gfx_level == GFX10_3;
 

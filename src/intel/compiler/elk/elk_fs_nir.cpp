@@ -1610,16 +1610,10 @@ fs_nir_emit_alu(nir_to_elk_state &ntb, nir_alu_instr *instr,
    case nir_op_pack_half_2x16:
       unreachable("not reached: should be handled by lower_packing_builtins");
 
-   case nir_op_unpack_half_2x16_split_x_flush_to_zero:
-      assert(FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP16 & execution_mode);
-      FALLTHROUGH;
    case nir_op_unpack_half_2x16_split_x:
       inst = bld.F16TO32(result, subscript(op[0], ELK_REGISTER_TYPE_HF, 0));
       break;
 
-   case nir_op_unpack_half_2x16_split_y_flush_to_zero:
-      assert(FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP16 & execution_mode);
-      FALLTHROUGH;
    case nir_op_unpack_half_2x16_split_y:
       inst = bld.F16TO32(result, subscript(op[0], ELK_REGISTER_TYPE_HF, 1));
       break;
@@ -3754,10 +3748,8 @@ fs_nir_emit_fs_intrinsic(nir_to_elk_state &ntb,
    }
 
    case nir_intrinsic_demote:
-   case nir_intrinsic_discard:
    case nir_intrinsic_terminate:
    case nir_intrinsic_demote_if:
-   case nir_intrinsic_discard_if:
    case nir_intrinsic_terminate_if: {
       /* We track our discarded pixels in f0.1/f1.0.  By predicating on it, we
        * can update just the flag bits that aren't yet discarded.  If there's
@@ -3766,7 +3758,6 @@ fs_nir_emit_fs_intrinsic(nir_to_elk_state &ntb,
        */
       elk_fs_inst *cmp = NULL;
       if (instr->intrinsic == nir_intrinsic_demote_if ||
-          instr->intrinsic == nir_intrinsic_discard_if ||
           instr->intrinsic == nir_intrinsic_terminate_if) {
          nir_alu_instr *alu = nir_src_as_alu_instr(instr->src[0]);
 

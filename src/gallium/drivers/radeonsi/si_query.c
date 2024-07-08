@@ -547,7 +547,14 @@ bool si_query_buffer_alloc(struct si_context *sctx, struct si_query_buffer *buff
        */
       struct si_screen *screen = sctx->screen;
       unsigned buf_size = MAX2(size, screen->info.min_alloc_size);
-      buffer->buf = si_resource(pipe_buffer_create(&screen->b, 0, PIPE_USAGE_STAGING, buf_size));
+
+      /* We need to bypass GL2 for queries if SET_PREDICATION accesses it uncached
+       * in a spinloop.
+       */
+      buffer->buf =  si_aligned_buffer_create(&screen->b,
+                                              screen->info.cp_sdma_ge_use_system_memory_scope ?
+                                                 SI_RESOURCE_FLAG_GL2_BYPASS : 0,
+                                              PIPE_USAGE_STAGING, buf_size, 256);
       if (unlikely(!buffer->buf))
          return false;
       unprepared = true;
@@ -589,32 +596,20 @@ static bool si_query_hw_prepare_buffer(struct si_context *sctx, struct si_query_
        query->b.type == PIPE_QUERY_OCCLUSION_PREDICATE ||
        query->b.type == PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE) {
       unsigned max_rbs = screen->info.max_render_backends;
-      unsigned num_results = qbuf->buf->b.b.width0 / query->result_size;
+      uint64_t enabled_rb_mask = screen->info.enabled_rb_mask;
+      unsigned num_results;
+      unsigned i, j;
 
-      if (screen->info.gfx_level >= GFX9) {
-         unsigned num_rbs = screen->info.num_rb;
-
-         for (unsigned j = 0; j < num_results; j++) {
-            /* Results of enabled RBs are packed, so the disabled ones are always at the end. */
-            for (unsigned i = num_rbs; i < max_rbs; i++) {
+      /* Set top bits for unused backends. */
+      num_results = qbuf->buf->b.b.width0 / query->result_size;
+      for (j = 0; j < num_results; j++) {
+         for (i = 0; i < max_rbs; i++) {
+            if (!(enabled_rb_mask & (1ull << i))) {
                results[(i * 4) + 1] = 0x80000000;
                results[(i * 4) + 3] = 0x80000000;
             }
-            results += 4 * max_rbs;
          }
-      } else {
-         uint64_t enabled_rb_mask = screen->info.enabled_rb_mask;
-
-         /* Set top bits for unused backends. */
-         for (unsigned j = 0; j < num_results; j++) {
-            for (unsigned i = 0; i < max_rbs; i++) {
-               if (!(enabled_rb_mask & (1ull << i))) {
-                  results[(i * 4) + 1] = 0x80000000;
-                  results[(i * 4) + 3] = 0x80000000;
-               }
-            }
-            results += 4 * max_rbs;
-         }
+         results += 4 * max_rbs;
       }
    }
 
@@ -1610,7 +1605,8 @@ static void si_query_hw_get_result_resource(struct si_context *sctx, struct si_q
       break;
    }
 
-   sctx->flags |= sctx->screen->barrier_flags.cp_to_L2;
+   sctx->flags |= SI_CONTEXT_INV_SCACHE | SI_CONTEXT_INV_VCACHE |
+                  (sctx->gfx_level <= GFX8 ? SI_CONTEXT_INV_L2 : 0);
    si_mark_atom_dirty(sctx, &sctx->atoms.s.cache_flush);
 
    for (qbuf = &query->buffer; qbuf; qbuf = qbuf_prev) {
@@ -1706,8 +1702,10 @@ static void si_render_condition(struct pipe_context *ctx, struct pipe_query *que
 
          /* Settings this in the render cond atom is too late,
           * so set it here. */
-         sctx->flags |= sctx->screen->barrier_flags.L2_to_cp;
-         si_mark_atom_dirty(sctx, &sctx->atoms.s.cache_flush);
+         if (sctx->gfx_level <= GFX8) {
+            sctx->flags |= SI_CONTEXT_WB_L2;
+            si_mark_atom_dirty(sctx, &sctx->atoms.s.cache_flush);
+         }
 
          sctx->render_cond_enabled = old_render_cond_enabled;
       }

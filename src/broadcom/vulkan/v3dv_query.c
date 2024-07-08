@@ -773,6 +773,9 @@ v3dv_GetQueryPoolResults(VkDevice _device,
    V3DV_FROM_HANDLE(v3dv_device, device, _device);
    V3DV_FROM_HANDLE(v3dv_query_pool, pool, queryPool);
 
+   if (vk_device_is_lost(&device->vk))
+      return VK_ERROR_DEVICE_LOST;
+
    return v3dv_get_query_pool_results_cpu(device, pool, firstQuery, queryCount,
                                           pData, stride, flags);
 }
@@ -1350,7 +1353,8 @@ v3dv_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
 {
    V3DV_FROM_HANDLE(v3dv_physical_device, pDevice, physicalDevice);
 
-   return v3dv_X(pDevice, enumerate_performance_query_counters)(pCounterCount,
+   return v3dv_X(pDevice, enumerate_performance_query_counters)(pDevice,
+                                                                pCounterCount,
                                                                 pCounters,
                                                                 pCounterDescriptions);
 }

@@ -177,7 +177,7 @@ create_cov(struct ir3_context *ctx, struct ir3_instruction *src,
          src_type = TYPE_S16;
          break;
       case 8:
-         src_type = TYPE_S8;
+         src_type = TYPE_U8;
          break;
       default:
          ir3_context_error(ctx, "invalid src bit size: %u", src_bitsize);
@@ -248,7 +248,7 @@ create_cov(struct ir3_context *ctx, struct ir3_instruction *src,
    case nir_op_f2i8:
    case nir_op_i2i8:
    case nir_op_b2i8:
-      dst_type = TYPE_S8;
+      dst_type = TYPE_U8;
       break;
 
    case nir_op_f2u32:
@@ -273,17 +273,66 @@ create_cov(struct ir3_context *ctx, struct ir3_instruction *src,
    if (src_type == dst_type)
       return src;
 
+   /* Zero-extension of 8-bit values doesn't work with `cov`, so simple masking
+    * is used to achieve the result.
+    */
+   if (src_type == TYPE_U8 && full_type(dst_type) == TYPE_U32) {
+      struct ir3_instruction *mask = create_immed_typed(ctx->block, 0xff, TYPE_U8);
+      struct ir3_instruction *cov = ir3_AND_B(ctx->block, src, 0, mask, 0);
+      cov->dsts[0]->flags |= type_flags(dst_type);
+      return cov;
+   }
+
+   /* Conversion of 8-bit values into floating-point values doesn't work with
+    * a simple `cov`, instead the 8-bit values first have to be converted into
+    * corresponding 16-bit values and converted from there.
+    */
+   if (src_type == TYPE_U8 && full_type(dst_type) == TYPE_F32) {
+      assert(op == nir_op_u2f16 || op == nir_op_i2f16 ||
+             op == nir_op_u2f32 || op == nir_op_i2f32);
+
+      struct ir3_instruction *cov;
+      if (op == nir_op_u2f16 || op == nir_op_u2f32) {
+         struct ir3_instruction *mask = create_immed_typed(ctx->block, 0xff, TYPE_U8);
+         cov = ir3_AND_B(ctx->block, src, 0, mask, 0);
+         cov->dsts[0]->flags |= IR3_REG_HALF;
+         cov = ir3_COV(ctx->block, cov, TYPE_U16, dst_type);
+      } else {
+         cov = ir3_COV(ctx->block, src, TYPE_U8, TYPE_S16);
+         cov = ir3_COV(ctx->block, cov, TYPE_S16, dst_type);
+      }
+      return cov;
+   }
+
+   /* Conversion of floating-point values to 8-bit values also doesn't work
+    * through a single `cov`, instead the conversion has to go through the
+    * corresponding 16-bit type that's then truncated.
+    */
+   if (full_type(src_type) == TYPE_F32 && dst_type == TYPE_U8) {
+      assert(op == nir_op_f2u8 || op == nir_op_f2i8);
+
+      type_t intermediate_type = op == nir_op_f2u8 ? TYPE_U16 : TYPE_S16;
+      struct ir3_instruction *cov = ir3_COV(ctx->block, src, src_type, intermediate_type);
+      cov = ir3_COV(ctx->block, cov, intermediate_type, TYPE_U8);
+      return cov;
+   }
+
    struct ir3_instruction *cov = ir3_COV(ctx->block, src, src_type, dst_type);
 
    if (op == nir_op_f2f16_rtne) {
       cov->cat1.round = ROUND_EVEN;
-   } else if (op == nir_op_f2f16) {
+   } else if (op == nir_op_f2f16_rtz) {
+      cov->cat1.round = ROUND_ZERO;
+   } else if (dst_type == TYPE_F16 || dst_type == TYPE_F32) {
       unsigned execution_mode = ctx->s->info.float_controls_execution_mode;
+      nir_alu_type type =
+         dst_type == TYPE_F16 ? nir_type_float16 : nir_type_float32;
       nir_rounding_mode rounding_mode =
-         nir_get_rounding_mode_from_float_controls(execution_mode,
-                                                   nir_type_float16);
+         nir_get_rounding_mode_from_float_controls(execution_mode, type);
       if (rounding_mode == nir_rounding_mode_rtne)
          cov->cat1.round = ROUND_EVEN;
+      else if (rounding_mode == nir_rounding_mode_rtz)
+         cov->cat1.round = ROUND_ZERO;
    }
 
    return cov;
@@ -946,6 +995,12 @@ emit_intrinsic_copy_ubo_to_uniform(struct ir3_context *ctx,
 
    ir3_instr_set_address(ldc, addr1);
 
+   /* The assembler isn't aware of what value a1.x has, so make sure that
+    * constlen includes the ldc.k here.
+    */
+   ctx->so->constlen =
+      MAX2(ctx->so->constlen, DIV_ROUND_UP(base + size * 4, 4));
+
    array_insert(b, b->keeps, ldc);
 }
 
@@ -978,6 +1033,12 @@ emit_intrinsic_copy_global_to_uniform(struct ir3_context *ctx,
       ir3_instr_set_address(ldg, a1);
       ldg->flags |= IR3_INSTR_A1EN;
    }
+
+   /* The assembler isn't aware of what value a1.x has, so make sure that
+    * constlen includes the ldg.k here.
+    */
+   ctx->so->constlen =
+      MAX2(ctx->so->constlen, DIV_ROUND_UP(dst + size * 4, 4));
 
    array_insert(b, b->keeps, ldg);
 }
@@ -1592,23 +1653,46 @@ emit_intrinsic_load_ssbo(struct ir3_context *ctx,
                          nir_intrinsic_instr *intr,
                          struct ir3_instruction **dst)
 {
-   /* Note: isam currently can't handle vectorized loads/stores */
+   /* Note: we can only use isam for vectorized loads/stores if isam.v is
+    * available.
+    * Note: isam also can't handle 8-bit loads.
+    */
    if (!(nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) ||
-       intr->def.num_components > 1 ||
+       (intr->def.num_components > 1 && !ctx->compiler->has_isam_v) ||
+       (ctx->compiler->options.storage_8bit && intr->def.bit_size == 8) ||
        !ctx->compiler->has_isam_ssbo) {
       ctx->funcs->emit_intrinsic_load_ssbo(ctx, intr, dst);
       return;
    }
 
    struct ir3_block *b = ctx->block;
-   struct ir3_instruction *offset = ir3_get_src(ctx, &intr->src[2])[0];
-   struct ir3_instruction *coords = ir3_collect(b, offset, create_immed(b, 0));
+   nir_src *offset_src = &intr->src[2];
+   struct ir3_instruction *coords = NULL;
+   unsigned imm_offset = 0;
+
+   if (ctx->compiler->has_isam_v) {
+      ir3_lower_imm_offset(ctx, intr, offset_src, 8, &coords, &imm_offset);
+   } else {
+      coords =
+         ir3_collect(b, ir3_get_src(ctx, offset_src)[0], create_immed(b, 0));
+   }
+
    struct tex_src_info info = get_image_ssbo_samp_tex_src(ctx, &intr->src[0], false);
 
    unsigned num_components = intr->def.num_components;
+   assert(num_components == 1 || ctx->compiler->has_isam_v);
+
    struct ir3_instruction *sam =
       emit_sam(ctx, OPC_ISAM, info, utype_for_size(intr->def.bit_size),
-               MASK(num_components), coords, NULL);
+               MASK(num_components), coords, create_immed(b, imm_offset));
+
+   if (ctx->compiler->has_isam_v) {
+      sam->flags |= (IR3_INSTR_V | IR3_INSTR_INV_1D);
+
+      if (imm_offset) {
+         sam->flags |= IR3_INSTR_IMM_OFFSET;
+      }
+   }
 
    ir3_handle_nonuniform(sam, intr);
 
@@ -2616,16 +2700,13 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       }
       break;
    }
-   case nir_intrinsic_discard_if:
-   case nir_intrinsic_discard:
    case nir_intrinsic_demote:
    case nir_intrinsic_demote_if:
    case nir_intrinsic_terminate:
    case nir_intrinsic_terminate_if: {
       struct ir3_instruction *cond, *kill;
 
-      if (intr->intrinsic == nir_intrinsic_discard_if ||
-          intr->intrinsic == nir_intrinsic_demote_if ||
+      if (intr->intrinsic == nir_intrinsic_demote_if ||
           intr->intrinsic == nir_intrinsic_terminate_if) {
          /* conditional discard: */
          src = ir3_get_src(ctx, &intr->src[0]);
@@ -2678,6 +2759,10 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       break;
    }
    case nir_intrinsic_elect:
+      dst[0] = ir3_ELECT_MACRO(ctx->block);
+      dst[0]->flags |= IR3_INSTR_NEEDS_HELPERS;
+      break;
+   case nir_intrinsic_elect_any_ir3:
       dst[0] = ir3_ELECT_MACRO(ctx->block);
       break;
    case nir_intrinsic_preamble_start_ir3:
@@ -2835,6 +2920,11 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
          ir3_instr_set_address(stc, a1);
          stc->flags |= IR3_INSTR_A1EN;
       }
+      /* The assembler isn't aware of what value a1.x has, so make sure that
+       * constlen includes the stc here.
+       */
+      ctx->so->constlen =
+         MAX2(ctx->so->constlen, DIV_ROUND_UP(dst + components, 4));
       array_insert(b, b->keeps, stc);
       break;
    }
@@ -3947,9 +4037,8 @@ instr_can_be_predicated(nir_instr *instr)
       case nir_intrinsic_brcst_active_ir3:
       case nir_intrinsic_ballot:
       case nir_intrinsic_elect:
+      case nir_intrinsic_elect_any_ir3:
       case nir_intrinsic_read_invocation_cond_ir3:
-      case nir_intrinsic_discard_if:
-      case nir_intrinsic_discard:
       case nir_intrinsic_demote:
       case nir_intrinsic_demote_if:
       case nir_intrinsic_terminate:
@@ -4088,7 +4177,8 @@ emit_if(struct ir3_context *ctx, nir_if *nif)
       ir3_BALL(ctx->block, pred, IR3_REG_PREDICATE);
    } else if (condition->opc == OPC_ELECT_MACRO &&
               condition->block == ctx->block) {
-      ir3_GETONE(ctx->block);
+      struct ir3_instruction *branch = ir3_GETONE(ctx->block);
+      branch->flags |= condition->flags & IR3_INSTR_NEEDS_HELPERS;
    } else if (condition->opc == OPC_SHPS_MACRO &&
               condition->block == ctx->block) {
       /* TODO: technically this only works if the block is the only user of the
@@ -4844,18 +4934,36 @@ emit_instructions(struct ir3_context *ctx)
       ir3_declare_array(ctx, decl);
    }
 
-   if (ctx->so->type == MESA_SHADER_TESS_CTRL &&
-       ctx->compiler->tess_use_shared) {
-      struct ir3_instruction *barrier = ir3_BAR(ctx->block);
-      barrier->flags = IR3_INSTR_SS | IR3_INSTR_SY;
-      barrier->barrier_class = IR3_BARRIER_EVERYTHING;
-      array_insert(ctx->block, ctx->block->keeps, barrier);
-      ctx->so->has_barrier = true;
-   }
-
    /* And emit the body: */
    ctx->impl = fxn;
    emit_function(ctx, fxn);
+
+   if (ctx->so->type == MESA_SHADER_TESS_CTRL &&
+       ctx->compiler->tess_use_shared) {
+      /* Anything before shpe seems to be ignored in the main shader when early
+       * preamble is enabled on a7xx, so we have to put the barrier after.
+       */
+      struct ir3_block *block = ir3_after_preamble(ctx->ir);
+
+      struct ir3_instruction *barrier = ir3_BAR(block);
+      barrier->flags = IR3_INSTR_SS | IR3_INSTR_SY;
+      barrier->barrier_class = IR3_BARRIER_EVERYTHING;
+      array_insert(block, block->keeps, barrier);
+      ctx->so->has_barrier = true;
+
+      /* Move the barrier to the beginning of the block but after any phi/input
+       * meta instructions that must be at the beginning. It must be before we
+       * load VS outputs.
+       */
+      foreach_instr (instr, &block->instr_list) {
+         if (instr->opc != OPC_META_INPUT &&
+             instr->opc != OPC_META_TEX_PREFETCH &&
+             instr->opc != OPC_META_PHI) {
+            ir3_instr_move_before(barrier, instr);
+            break;
+         }
+      }
+   }
 }
 
 /* Fixup tex sampler state for astc/srgb workaround instructions.  We
@@ -5478,6 +5586,11 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
       so->post_depth_coverage = true;
 
    ctx->so->per_samp = ctx->s->info.fs.uses_sample_shading;
+
+   if (ctx->so->type == MESA_SHADER_FRAGMENT &&
+       compiler->fs_must_have_non_zero_constlen_quirk) {
+      so->constlen = MAX2(so->constlen, 4);
+   }
 
 out:
    if (ret) {

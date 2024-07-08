@@ -114,7 +114,6 @@ zink_debug_options[] = {
    { "optimal_keys", ZINK_DEBUG_OPTIMAL_KEYS, "Debug/use optimal_keys" },
    { "noopt", ZINK_DEBUG_NOOPT, "Disable async optimized pipeline compiles" },
    { "nobgc", ZINK_DEBUG_NOBGC, "Disable all async pipeline compiles" },
-   { "dgc", ZINK_DEBUG_DGC, "Use DGC (driver testing only)" },
    { "mem", ZINK_DEBUG_MEM, "Debug memory allocations" },
    { "quiet", ZINK_DEBUG_QUIET, "Suppress warnings" },
    { "ioopt", ZINK_DEBUG_IOOPT, "Optimize IO" },
@@ -856,8 +855,6 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_TEXTURE_TRANSFER_MODES: {
       enum pipe_texture_transfer_mode mode = PIPE_TEXTURE_TRANSFER_BLIT;
       if (!screen->is_cpu &&
-          /* this needs substantial perf tuning */
-          screen->info.driver_props.driverID != VK_DRIVER_ID_MESA_TURNIP &&
           screen->info.have_KHR_8bit_storage &&
           screen->info.have_KHR_16bit_storage &&
           screen->info.have_KHR_shader_float16_int8)
@@ -1560,10 +1557,8 @@ zink_destroy_screen(struct pipe_screen *pscreen)
 {
    struct zink_screen *screen = zink_screen(pscreen);
 
-#ifdef HAVE_RENDERDOC_APP_H
    if (screen->renderdoc_capture_all && p_atomic_dec_zero(&num_screens))
       screen->renderdoc_api->EndFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(screen->instance), NULL);
-#endif
 
    hash_table_foreach(&screen->dts, entry)
       zink_kopper_deinit_displaytarget(screen, entry->data);
@@ -1642,7 +1637,6 @@ zink_destroy_screen(struct pipe_screen *pscreen)
       close(screen->drm_fd);
 
    slab_destroy_parent(&screen->transfer_pool);
-   slab_destroy(&screen->present_mempool);
    ralloc_free(screen);
    glsl_type_singleton_decref();
 }
@@ -2305,7 +2299,7 @@ retry:
 static void
 setup_renderdoc(struct zink_screen *screen)
 {
-#ifdef HAVE_RENDERDOC_APP_H
+#ifndef _WIN32
    const char *capture_id = debug_get_option("ZINK_RENDERDOC", NULL);
    if (!capture_id)
       return;
@@ -3007,6 +3001,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
    case VK_DRIVER_ID_BROADCOM_PROPRIETARY:
    case VK_DRIVER_ID_ARM_PROPRIETARY:
+   case VK_DRIVER_ID_MESA_HONEYKRISP:
       screen->driver_workarounds.track_renderpasses = true; //screen->info.primgen_feats.primitivesGeneratedQueryWithRasterizerDiscard
       break;
    default:
@@ -3016,16 +3011,6 @@ init_driver_workarounds(struct zink_screen *screen)
       screen->driver_workarounds.track_renderpasses = true;
    else if (zink_debug & ZINK_DEBUG_NORP)
       screen->driver_workarounds.track_renderpasses = false;
-
-   /* these drivers can't optimize non-overlapping copy ops */
-   switch (screen->info.driver_props.driverID) {
-   case VK_DRIVER_ID_MESA_TURNIP:
-   case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
-      screen->driver_workarounds.broken_cache_semantics = true;
-      break;
-   default:
-      break;
-   }
 
    /* these drivers can successfully do INVALID <-> LINEAR dri3 modifier swap */
    switch (screen->info.driver_props.driverID) {
@@ -3055,6 +3040,19 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_AMD_PROPRIETARY:
       /* this has bad perf on AMD */
       screen->info.have_KHR_push_descriptor = false;
+      /* Interpolation is not consistent between two triangles of a rectangle. */
+      screen->driver_workarounds.inconsistent_interpolation = true;
+      break;
+   default:
+      break;
+   }
+
+   screen->driver_workarounds.can_2d_view_sparse = true;
+   switch (screen->info.driver_props.driverID) {
+   case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+   case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+      /* this does wild things to block shapes */
+      screen->driver_workarounds.can_2d_view_sparse = false;
       break;
    default:
       break;
@@ -3144,17 +3142,6 @@ init_optimal_keys(struct zink_screen *screen)
       screen->info.have_EXT_shader_object = false;
    if (screen->info.have_EXT_shader_object)
       screen->have_full_ds3 = true;
-   if (zink_debug & ZINK_DEBUG_DGC) {
-      if (!screen->optimal_keys) {
-         mesa_loge("zink: can't DGC without optimal_keys!");
-         zink_debug &= ~ZINK_DEBUG_DGC;
-      } else {
-         screen->info.have_EXT_multi_draw = false;
-         screen->info.have_EXT_shader_object = false;
-         screen->info.have_EXT_graphics_pipeline_library = false;
-         screen->info.have_EXT_vertex_input_dynamic_state = false;
-      }
-   }
 }
 
 static struct disk_cache *
@@ -3268,12 +3255,12 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    struct zink_screen *screen = rzalloc(NULL, struct zink_screen);
    if (!screen) {
-      if (!config->driver_name_is_inferred)
+      if (!config || !config->driver_name_is_inferred)
          mesa_loge("ZINK: failed to allocate screen");
       return NULL;
    }
 
-   screen->driver_name_is_inferred = config->driver_name_is_inferred;
+   screen->driver_name_is_inferred = config && config->driver_name_is_inferred;
    screen->drm_fd = -1;
 
    glsl_type_singleton_init_or_ref();
@@ -3417,13 +3404,6 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          mesa_loge("zink: KHR_timeline_semaphore is required");
       goto fail;
    }
-   if (zink_debug & ZINK_DEBUG_DGC) {
-      if (!screen->info.have_NV_device_generated_commands) {
-         if (!screen->driver_name_is_inferred)
-            mesa_loge("zink: can't use DGC without NV_device_generated_commands");
-         goto fail;
-      }
-   }
 
    if (zink_debug & ZINK_DEBUG_MEM) {
       simple_mtx_init(&screen->debug_mem_lock, mtx_plain);
@@ -3559,9 +3539,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    populate_format_props(screen);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct zink_transfer), 16);
-   slab_create(&screen->present_mempool, sizeof(struct zink_kopper_present_info), 16);
 
-   screen->driconf.inline_uniforms = debug_get_bool_option("ZINK_INLINE_UNIFORMS", screen->is_cpu) && !(zink_debug & ZINK_DEBUG_DGC);
+   screen->driconf.inline_uniforms = debug_get_bool_option("ZINK_INLINE_UNIFORMS", screen->is_cpu);
 
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
@@ -3769,7 +3748,7 @@ zink_drm_create_screen(int fd, const struct pipe_screen_config *config)
    return &ret->base;
 }
 
-void zink_stub_function_not_loaded()
+void VKAPI_PTR zink_stub_function_not_loaded()
 {
    /* this will be used by the zink_verify_*_extensions() functions on a
     * release build

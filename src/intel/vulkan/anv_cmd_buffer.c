@@ -79,9 +79,6 @@ anv_cmd_state_reset(struct anv_cmd_buffer *cmd_buffer)
 {
    anv_cmd_state_finish(cmd_buffer);
    anv_cmd_state_init(cmd_buffer);
-
-   cmd_buffer->last_compute_walker = NULL;
-   cmd_buffer->last_indirect_dispatch = NULL;
 }
 
 VkResult
@@ -174,9 +171,6 @@ anv_create_cmd_buffer(struct vk_command_pool *pool,
 
    cmd_buffer->generation.jump_addr = ANV_NULL_ADDRESS;
    cmd_buffer->generation.return_addr = ANV_NULL_ADDRESS;
-
-   cmd_buffer->last_compute_walker = NULL;
-   cmd_buffer->last_indirect_dispatch = NULL;
 
    memset(&cmd_buffer->generation.shader_state, 0,
           sizeof(cmd_buffer->generation.shader_state));
@@ -553,6 +547,9 @@ anv_cmd_buffer_flush_pipeline_state(struct anv_cmd_buffer *cmd_buffer,
 
    /* Compare all states, including partial packed ones, the dynamic part is
     * left at 0 but the static part could still change.
+    *
+    * We avoid comparing protected packets as all the fields but the scratch
+    * surface are identical. we just need to select the right one at emission.
     */
    diff_fix_state(URB,                      final.urb);
    diff_fix_state(VF_SGVS,                  final.vf_sgvs);

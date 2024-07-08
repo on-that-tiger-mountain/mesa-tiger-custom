@@ -46,6 +46,7 @@
 #include "util/set.h"
 #include "util/simple_mtx.h"
 #include "util/slab.h"
+#include "util/u_blitter.h"
 #include "util/u_dynarray.h"
 #include "util/u_idalloc.h"
 #include "util/u_live_shader_cache.h"
@@ -62,9 +63,7 @@
 #include "zink_shader_keys.h"
 #include "vk_dispatch_table.h"
 
-#ifdef HAVE_RENDERDOC_APP_H
 #include "renderdoc_app.h"
-#endif
 
 /* the descriptor binding id for fbfetch/input attachment */
 #define ZINK_FBFETCH_BINDING 5
@@ -101,15 +100,15 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
+ 
 extern uint32_t zink_debug;
 extern bool zink_tracing;
-
+ 
 #ifdef __cplusplus
 }
 #endif
 
-
+ 
 /** enums */
 
 /* features for draw/program templates */
@@ -238,11 +237,10 @@ enum zink_debug {
    ZINK_DEBUG_OPTIMAL_KEYS = (1<<14),
    ZINK_DEBUG_NOOPT = (1<<15),
    ZINK_DEBUG_NOBGC = (1<<16),
-   ZINK_DEBUG_DGC = (1<<17),
-   ZINK_DEBUG_MEM = (1<<18),
-   ZINK_DEBUG_QUIET = (1<<19),
-   ZINK_DEBUG_IOOPT = (1<<20),
-   ZINK_DEBUG_NOPC = (1<<21),
+   ZINK_DEBUG_MEM = (1<<17),
+   ZINK_DEBUG_QUIET = (1<<18),
+   ZINK_DEBUG_IOOPT = (1<<19),
+   ZINK_DEBUG_NOPC = (1<<20),
 };
 
 enum zink_pv_emulation_primitive {
@@ -251,15 +249,6 @@ enum zink_pv_emulation_primitive {
    /* when triangle or quad strips are used and the gs outputs triangles */
    ZINK_PVE_PRIMITIVE_TRISTRIP = 2,
    ZINK_PVE_PRIMITIVE_FAN = 3,
-};
-
-enum zink_dgc_buffer {
-   ZINK_DGC_VBO,
-   ZINK_DGC_IB,
-   ZINK_DGC_PSO,
-   ZINK_DGC_PUSH,
-   ZINK_DGC_DRAW,
-   ZINK_DGC_MAX,
 };
 
 /** fence types */
@@ -619,11 +608,6 @@ struct zink_batch_state {
    struct zink_resource *swapchain;
    struct util_dynarray acquires;
    struct util_dynarray acquire_flags;
-
-   struct {
-      struct util_dynarray pipelines;
-      struct util_dynarray layouts;
-   } dgc;
 
    VkAccessFlags unordered_write_access;
    VkPipelineStageFlags unordered_write_stages;
@@ -1435,7 +1419,6 @@ struct zink_screen {
    bool device_lost;
    int drm_fd;
 
-   struct slab_mempool present_mempool;
    struct slab_parent_pool transfer_pool;
    struct disk_cache *disk_cache;
    struct util_queue cache_put_thread;
@@ -1511,14 +1494,12 @@ struct zink_screen {
 
    unsigned screen_id;
 
-#ifdef HAVE_RENDERDOC_APP_H
    RENDERDOC_API_1_0_0 *renderdoc_api;
    unsigned renderdoc_capture_start;
    unsigned renderdoc_capture_end;
    unsigned renderdoc_frame;
    bool renderdoc_capturing;
    bool renderdoc_capture_all;
-#endif
 
    struct vk_uncompacted_dispatch_table vk;
 
@@ -1562,6 +1543,8 @@ struct zink_screen {
       bool needs_zs_shader_swizzle;
       bool can_do_invalid_linear_modifier;
       bool io_opt;
+      bool inconsistent_interpolation;
+      bool can_2d_view_sparse;
       unsigned z16_unscaled_bias;
       unsigned z24_unscaled_bias;
    } driver_workarounds;
@@ -1939,19 +1922,6 @@ struct zink_context {
       uint64_t render_passes;
    } hud;
 
-   struct {
-      bool valid;
-      struct u_upload_mgr *upload[ZINK_DGC_MAX];
-      struct zink_resource *buffers[ZINK_DGC_MAX];
-      struct zink_gfx_program *last_prog;
-      uint8_t *maps[ZINK_DGC_MAX];
-      size_t bind_offsets[ZINK_DGC_MAX];
-      size_t cur_offsets[ZINK_DGC_MAX];
-      size_t max_size[ZINK_DGC_MAX];
-      struct util_dynarray pipelines;
-      struct util_dynarray tokens;
-   } dgc;
-
    struct pipe_resource *dummy_vertex_buffer;
    struct pipe_resource *dummy_xfb_buffer;
    struct pipe_surface *dummy_surface[7];
@@ -2042,6 +2012,8 @@ struct zink_context {
    bool is_device_lost;
    bool primitive_restart;
    bool blitting : 1;
+   bool blit_scissor : 1;
+   bool blit_nearest : 1;
    bool unordered_blitting : 1;
    bool vertex_state_changed : 1;
    bool blend_state_changed : 1;

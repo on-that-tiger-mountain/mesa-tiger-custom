@@ -16,11 +16,13 @@
 #include "util/half_float.h"
 #include "compiler/nir/nir_builder.h"
 
+#include "tu_buffer.h"
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_formats.h"
 #include "tu_image.h"
 #include "tu_tracepoints.h"
+#include "tu_lrz.h"
 
 #include "common/freedreno_gpu_event.h"
 
@@ -1317,7 +1319,6 @@ r3d_src_gmem(struct tu_cmd_buffer *cmd,
    r3d_src_common(cmd, cs, desc, 0, 0, VK_FILTER_NEAREST);
 }
 
-template <chip CHIP>
 static void
 r3d_dst(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
         enum pipe_format src_format)
@@ -1338,9 +1339,6 @@ r3d_dst(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
 
    tu_cs_emit_pkt4(cs, REG_A6XX_RB_MRT_FLAG_BUFFER(0), 3);
    tu_cs_image_flag_ref(cs, iview, layer);
-
-   if (CHIP >= A7XX)
-      tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO(0));
 
    /* Use color format from RB_MRT_BUF_INFO. This register is relevant for
     * FMT6_NV12_Y.
@@ -1541,6 +1539,9 @@ r3d_setup(struct tu_cmd_buffer *cmd,
    tu_cs_emit_regs(cs, A6XX_GRAS_LRZ_CNTL(0));
    tu_cs_emit_regs(cs, A6XX_RB_LRZ_CNTL(0));
 
+   if (CHIP >= A7XX)
+      tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO());
+
    tu_cs_emit_write_reg(cs, REG_A6XX_GRAS_SC_CNTL,
                         A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2));
 
@@ -1661,7 +1662,7 @@ static const struct blit_ops r3d_ops = {
    .clear_value = r3d_clear_value,
    .src = r3d_src,
    .src_buffer = r3d_src_buffer<CHIP>,
-   .dst = r3d_dst<CHIP>,
+   .dst = r3d_dst,
    .dst_depth = r3d_dst_depth,
    .dst_stencil = r3d_dst_stencil,
    .dst_buffer = r3d_dst_buffer,
@@ -1799,7 +1800,7 @@ tu6_clear_lrz(struct tu_cmd_buffer *cmd,
     * LRZ via CCU. Don't need to invalidate CCU since we are presumably
     * writing whole cache lines we assume to be 64 bytes.
     */
-   tu_emit_event_write<CHIP>(cmd, &cmd->cs, FD_CACHE_FLUSH);
+   tu_emit_event_write<CHIP>(cmd, &cmd->cs, FD_CACHE_CLEAN);
 
    ops->setup(cmd, cs, PIPE_FORMAT_Z16_UNORM, PIPE_FORMAT_Z16_UNORM,
               VK_IMAGE_ASPECT_DEPTH_BIT, 0, true, false,
@@ -1817,7 +1818,7 @@ tu6_clear_lrz(struct tu_cmd_buffer *cmd,
     * UCHE in the earlier GRAS stage.
     */
    cmd->state.cache.flush_bits |=
-      TU_CMD_FLAG_CCU_FLUSH_COLOR | TU_CMD_FLAG_CACHE_INVALIDATE |
+      TU_CMD_FLAG_CCU_CLEAN_COLOR | TU_CMD_FLAG_CACHE_INVALIDATE |
       TU_CMD_FLAG_WAIT_FOR_IDLE;
 }
 TU_GENX(tu6_clear_lrz);
@@ -1832,16 +1833,30 @@ tu6_dirty_lrz_fc(struct tu_cmd_buffer *cmd,
    VkClearValue clear = {};
    clear.color.uint32[0] = 0xffffffff;
 
-   /* LRZ fast-clear buffer is always allocated with 512 bytes size. */
+   using LRZFC = tu_lrzfc_layout<CHIP>;
+   uint64_t lrz_fc_iova = image->iova + image->lrz_fc_offset;
    ops->setup(cmd, cs, PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R32_UINT,
               VK_IMAGE_ASPECT_COLOR_BIT, 0, true, false,
               VK_SAMPLE_COUNT_1_BIT);
    ops->clear_value(cmd, cs, PIPE_FORMAT_R32_UINT, &clear);
    ops->dst_buffer(cs, PIPE_FORMAT_R32_UINT,
-                   image->iova + image->lrz_fc_offset, 512,
+                   lrz_fc_iova + offsetof(LRZFC, fc1),
+                   sizeof(LRZFC::fc1),
                    PIPE_FORMAT_R32_UINT);
-   ops->coords(cmd, cs, (VkOffset2D) {}, blt_no_coord, (VkExtent2D) {128, 1});
+   ops->coords(cmd, cs, (VkOffset2D) {}, blt_no_coord, (VkExtent2D) {
+      sizeof(LRZFC::fc1) / sizeof(uint32_t), 1
+   });
    ops->run(cmd, cs);
+   if constexpr (LRZFC::HAS_BIDIR) {
+      ops->dst_buffer(cs, PIPE_FORMAT_R32_UINT,
+                      lrz_fc_iova + offsetof(LRZFC, fc2),
+                      sizeof(LRZFC::fc2),
+                      PIPE_FORMAT_R32_UINT);
+      ops->coords(cmd, cs, (VkOffset2D) {}, blt_no_coord, (VkExtent2D) {
+         sizeof(LRZFC::fc2) / sizeof(uint32_t), 1
+      });
+      ops->run(cmd, cs);
+   }
    ops->teardown(cmd, cs);
 }
 TU_GENX(tu6_dirty_lrz_fc);
@@ -2467,7 +2482,7 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
       /* When executed by the user there has to be a pipeline barrier here,
        * but since we're doing it manually we'll have to flush ourselves.
        */
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_COLOR);
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
       tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
       tu_cs_emit_wfi(cs);
 
@@ -3317,7 +3332,7 @@ tu_CmdClearAttachments(VkCommandBuffer commandBuffer,
       if ((pAttachments[j].aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) == 0)
          continue;
 
-      tu_lrz_disable_during_renderpass(cmd);
+      tu_lrz_disable_during_renderpass<CHIP>(cmd);
    }
 
    /* vkCmdClearAttachments is supposed to respect the predicate if active. The
@@ -3447,11 +3462,11 @@ tu_clear_sysmem_attachment(struct tu_cmd_buffer *cmd,
     * beforehand as depth should already be flushed.
     */
    if (vk_format_is_depth_or_stencil(attachment->format)) {
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_COLOR);
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_DEPTH);
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
       tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_INVALIDATE_DEPTH);
    } else {
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_COLOR);
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
       tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_INVALIDATE_COLOR);
    }
 
@@ -3644,7 +3659,7 @@ load_3d_blit(struct tu_cmd_buffer *cmd,
          struct apply_load_coords_state state = {
             .view = att->clear_views ? i : 0,
          };
-         tu_create_fdm_bin_patchpoint(cmd, cs, 1 + 3 + 8, fdm_apply_load_coords, state);
+         tu_create_fdm_bin_patchpoint(cmd, cs, 4, fdm_apply_load_coords, state);
       }
 
       r3d_dst_gmem(cmd, cs, iview, att, separate_stencil, i);
@@ -3826,7 +3841,7 @@ store_cp_blit(struct tu_cmd_buffer *cmd,
       /* On A7XX, we need to wait for any CP_EVENT_WRITE::BLIT operations
        * arising from GMEM load/clears to land before we can continue.
        */
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_BLIT_CACHE);
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_BLIT_CACHE);
 
    /* Wait for cache event to land */
    tu_cs_emit_wfi(cs);
@@ -3837,7 +3852,7 @@ store_cp_blit(struct tu_cmd_buffer *cmd,
     * sysmem, and we generally assume that GMEM renderpasses leave their
     * results in sysmem, so we need to flush manually here.
     */
-   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_COLOR);
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
 }
 
 template <chip CHIP>
@@ -3883,7 +3898,7 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
          r3d_dst_stencil(cs, iview, layer);
       }
    } else {
-      r3d_dst<CHIP>(cs, &iview->view, layer, src_format);
+      r3d_dst(cs, &iview->view, layer, src_format);
    }
 
    r3d_src_gmem<CHIP>(cmd, cs, iview, src_format, dst_format, gmem_offset, cpp);
@@ -3903,7 +3918,7 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
     * results in sysmem, so we need to flush manually here. The 3d blit path
     * writes to depth images as a color RT, so there's no need to flush depth.
     */
-   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_COLOR);
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
 
    /* Restore RB_BIN_CONTROL/GRAS_BIN_CONTROL saved above. */
    tu_cs_emit_pkt7(cs, CP_SCRATCH_TO_REG, 1);

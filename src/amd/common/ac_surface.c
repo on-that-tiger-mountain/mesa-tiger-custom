@@ -59,6 +59,12 @@
 #define AMDGPU_TILING_GFX12_SWIZZLE_MODE_MASK			0x7
 #define AMDGPU_TILING_GFX12_SCANOUT_SHIFT			63
 #define AMDGPU_TILING_GFX12_SCANOUT_MASK			0x1
+#define AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_SHIFT	3
+#define AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_MASK	0x3
+#define AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_SHIFT		5
+#define AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_MASK		0x7
+#define AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_SHIFT		8
+#define AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_MASK		0x3f
 #define AMDGPU_TILING_SET(field, value) \
 	(((__u64)(value) & AMDGPU_TILING_##field##_MASK) << AMDGPU_TILING_##field##_SHIFT)
 #define AMDGPU_TILING_GET(value, field) \
@@ -285,9 +291,13 @@ bool ac_is_modifier_supported(const struct radeon_info *info,
       if (!options->dcc)
          return false;
 
-      if (ac_modifier_has_dcc_retile(modifier) &&
-          (!info->use_display_dcc_with_retile_blit || !options->dcc_retile))
-         return false;
+      if (ac_modifier_has_dcc_retile(modifier)) {
+         /* radeonsi and radv retiling shaders only support bpe == 32. */
+         if (util_format_get_blocksizebits(format) != 32)
+            return false;
+         if (!info->use_display_dcc_with_retile_blit || !options->dcc_retile)
+            return false;
+      }
    }
 
    return true;
@@ -524,7 +534,7 @@ bool ac_get_supported_modifiers(const struct radeon_info *info,
    }
    case GFX12: {
       /* Chip properties no longer affect tiling, and there is no distinction between displayable
-       * and non-displayable anymore.
+       * and non-displayable anymore. (DCC settings may affect displayability though)
        *
        * Only declare 64K modifiers for now.
        */
@@ -537,9 +547,22 @@ bool ac_get_supported_modifiers(const struct radeon_info *info,
                                      AMD_FMT_MOD_SET(TILE_VERSION, AMD_FMT_MOD_TILE_VER_GFX11) |
                                      AMD_FMT_MOD_SET(TILE, AMD_FMT_MOD_TILE_GFX9_64K_D);
 
+      /* Expose both 128B and 64B compressed blocks. */
+      uint64_t dcc_128B = AMD_FMT_MOD_SET(DCC, 1) |
+                          AMD_FMT_MOD_SET(DCC_MAX_COMPRESSED_BLOCK, AMD_FMT_MOD_DCC_BLOCK_128B);
+      uint64_t dcc_64B = AMD_FMT_MOD_SET(DCC, 1) |
+                         AMD_FMT_MOD_SET(DCC_MAX_COMPRESSED_BLOCK, AMD_FMT_MOD_DCC_BLOCK_64B);
+
+      uint64_t mod_256B_2D = AMD_FMT_MOD |
+                             AMD_FMT_MOD_SET(TILE_VERSION, AMD_FMT_MOD_TILE_VER_GFX12) |
+                             AMD_FMT_MOD_SET(TILE, AMD_FMT_MOD_TILE_GFX12_256B_2D);
+
       /* Modifiers must be sorted from best to worst. */
-      ADD_MOD(mod_64K_2D)
+      ADD_MOD(mod_64K_2D | dcc_128B)      /* 64K with DCC and 128B compressed blocks */
+      ADD_MOD(mod_64K_2D | dcc_64B)       /* 64K with DCC and 64B compressed blocks */
+      ADD_MOD(mod_64K_2D)                 /* 64K without DCC */
       ADD_MOD(mod_64K_2D_as_gfx11)        /* the same as above, but for gfx11 interop */
+      ADD_MOD(mod_256B_2D)
       ADD_MOD(DRM_FORMAT_MOD_LINEAR)
       break;
    }
@@ -2744,8 +2767,10 @@ static unsigned gfx12_select_swizzle_mode(struct ac_addrlib *addrlib,
    get_in.numSamples = in->numSamples;
    get_in.maxAlign = info->has_dedicated_vram ? (256 * 1024) : (64 * 1024);
 
-   if (Addr3GetPossibleSwizzleModes(addrlib, &get_in, &get_out) != ADDR_OK)
-      return 0;
+   if (Addr3GetPossibleSwizzleModes(addrlib->handle, &get_in, &get_out) != ADDR_OK) {
+      assert(!"Addr3GetPossibleSwizzleModes failed");
+      return ADDR3_MAX_TYPE;
+   }
 
    /* TODO: Workaround for SW_LINEAR assertion failures in addrlib. This should be fixed in addrlib. */
    if (surf && surf->blk_w == 4)
@@ -3188,6 +3213,7 @@ static bool gfx12_compute_surface(struct ac_addrlib *addrlib, const struct radeo
    /* Select the swizzle mode. */
    if (surf->modifier != DRM_FORMAT_MOD_INVALID) {
       assert(!compressed);
+      assert(!ac_modifier_has_dcc(surf->modifier) || !(surf->flags & RADEON_SURF_DISABLE_DCC));
       AddrSurfInfoIn.swizzleMode = ac_get_modifier_swizzle_mode(info->gfx_level, surf->modifier);
    } else if (surf->flags & RADEON_SURF_IMPORTED) {
       AddrSurfInfoIn.swizzleMode = surf->u.gfx9.swizzle_mode;
@@ -3218,10 +3244,24 @@ static bool gfx12_compute_surface(struct ac_addrlib *addrlib, const struct radeo
 
    surf->u.gfx9.swizzle_mode = AddrSurfInfoIn.swizzleMode;
    surf->u.gfx9.resource_type = (enum gfx9_resource_type)AddrSurfInfoIn.resourceType;
+   surf->u.gfx9.gfx12_enable_dcc = ac_modifier_has_dcc(surf->modifier) ||
+                                   (surf->modifier == DRM_FORMAT_MOD_INVALID &&
+                                    !(surf->flags & RADEON_SURF_DISABLE_DCC) &&
+                                    /* Always enable compression for Z/S and MSAA color by default. */
+                                    (surf->flags & RADEON_SURF_Z_OR_SBUFFER ||
+                                     config->info.samples > 1 ||
+                                     /* TODO: enable display DCC after DAL is ready */
+                                     (!(surf->flags & RADEON_SURF_SCANOUT) &&
+                                     /* These two are not strictly necessary. */
+                                      surf->u.gfx9.swizzle_mode != ADDR3_LINEAR &&
+                                      surf->surf_size >= 4096)));
 
    surf->has_stencil = !!(surf->flags & RADEON_SURF_SBUFFER);
    surf->is_linear = surf->u.gfx9.swizzle_mode == ADDR3_LINEAR;
-   surf->is_displayable = !(surf->flags & RADEON_SURF_Z_OR_SBUFFER); // TODO: how to set is_displayable?
+   surf->is_displayable = !(surf->flags & RADEON_SURF_Z_OR_SBUFFER) &&
+                          surf->u.gfx9.resource_type != RADEON_RESOURCE_3D &&
+                          /* TODO: enable display DCC after DAL is ready */
+                          !surf->u.gfx9.gfx12_enable_dcc;
    surf->thick_tiling = surf->u.gfx9.swizzle_mode >= ADDR3_4KB_3D;
 
    if (surf->flags & RADEON_SURF_Z_OR_SBUFFER) {
@@ -3229,6 +3269,18 @@ static bool gfx12_compute_surface(struct ac_addrlib *addrlib, const struct radeo
       surf->u.gfx9.zs.hiz.size = 0;
       surf->u.gfx9.zs.his.offset = 0;
       surf->u.gfx9.zs.his.size = 0;
+   }
+
+   if (surf->u.gfx9.gfx12_enable_dcc) {
+      if (surf->modifier != DRM_FORMAT_MOD_INVALID) {
+         surf->u.gfx9.color.dcc.max_compressed_block_size =
+            AMD_FMT_MOD_GET(DCC_MAX_COMPRESSED_BLOCK, surf->modifier);
+      } else if (!(surf->flags & RADEON_SURF_Z_OR_SBUFFER) &&
+                 /* Don't change the DCC settings for imported buffers - they might differ. */
+                 !(surf->flags & RADEON_SURF_IMPORTED)) {
+         /* TODO: decide what to set for scanout buffers after DAL is ready */
+         surf->u.gfx9.color.dcc.max_compressed_block_size = V_028C78_MAX_BLOCK_SIZE_128B;
+      }
    }
 
    /* Calculate texture layout information. */
@@ -3430,6 +3482,12 @@ void ac_surface_apply_bo_metadata(const struct radeon_info *info, struct radeon_
 
    if (info->gfx_level >= GFX12) {
       surf->u.gfx9.swizzle_mode = AMDGPU_TILING_GET(tiling_flags, GFX12_SWIZZLE_MODE);
+      surf->u.gfx9.color.dcc.max_compressed_block_size =
+         AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_MAX_COMPRESSED_BLOCK);
+      surf->u.gfx9.color.dcc_data_format =
+         AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_DATA_FORMAT);
+      surf->u.gfx9.color.dcc_number_type =
+         AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_NUMBER_TYPE);
       scanout = AMDGPU_TILING_GET(tiling_flags, GFX12_SCANOUT);
    } else if (info->gfx_level >= GFX9) {
       surf->u.gfx9.swizzle_mode = AMDGPU_TILING_GET(tiling_flags, SWIZZLE_MODE);
@@ -3473,6 +3531,10 @@ void ac_surface_compute_bo_metadata(const struct radeon_info *info, struct radeo
 
    if (info->gfx_level >= GFX12) {
       *tiling_flags |= AMDGPU_TILING_SET(GFX12_SWIZZLE_MODE, surf->u.gfx9.swizzle_mode);
+      *tiling_flags |= AMDGPU_TILING_SET(GFX12_DCC_MAX_COMPRESSED_BLOCK,
+                                         surf->u.gfx9.color.dcc.max_compressed_block_size);
+      *tiling_flags |= AMDGPU_TILING_SET(GFX12_DCC_NUMBER_TYPE, surf->u.gfx9.color.dcc_number_type);
+      *tiling_flags |= AMDGPU_TILING_SET(GFX12_DCC_DATA_FORMAT, surf->u.gfx9.color.dcc_data_format);
       *tiling_flags |= AMDGPU_TILING_SET(GFX12_SCANOUT, (surf->flags & RADEON_SURF_SCANOUT) != 0);
    } else if (info->gfx_level >= GFX9) {
       uint64_t dcc_offset = 0;
@@ -3970,14 +4032,54 @@ ac_surface_addr_from_coord(struct ac_addrlib *addrlib, const struct radeon_info 
    return output.addr;
 }
 
-void
-ac_surface_compute_nbc_view(struct ac_addrlib *addrlib, const struct radeon_info *info,
+static void
+gfx12_surface_compute_nbc_view(struct ac_addrlib *addrlib, const struct radeon_info *info,
                             const struct radeon_surf *surf, const struct ac_surf_info *surf_info,
                             unsigned level, unsigned layer, struct ac_surf_nbc_view *out)
 {
-   /* Only implemented for GFX10+ */
-   assert(info->gfx_level >= GFX10);
+   ADDR3_COMPUTE_NONBLOCKCOMPRESSEDVIEW_INPUT input = {0};
+   input.size = sizeof(ADDR3_COMPUTE_NONBLOCKCOMPRESSEDVIEW_INPUT);
+   input.swizzleMode = surf->u.gfx9.swizzle_mode;
+   input.resourceType = (AddrResourceType)surf->u.gfx9.resource_type;
+   switch (surf->bpe) {
+   case 8:
+      input.format = ADDR_FMT_BC1;
+      break;
+   case 16:
+      input.format = ADDR_FMT_BC3;
+      break;
+   default:
+      assert(0);
+   }
+   input.unAlignedDims.width = surf_info->width;
+   input.unAlignedDims.height = surf_info->height;
+   input.numMipLevels = surf_info->levels;
+   input.pipeBankXor = surf->tile_swizzle;
+   input.slice = layer;
+   input.mipId = level;
 
+   ADDR_E_RETURNCODE res;
+   ADDR3_COMPUTE_NONBLOCKCOMPRESSEDVIEW_OUTPUT output = {0};
+   output.size = sizeof(ADDR3_COMPUTE_NONBLOCKCOMPRESSEDVIEW_OUTPUT);
+   res = Addr3ComputeNonBlockCompressedView(addrlib->handle, &input, &output);
+   if (res == ADDR_OK) {
+      out->base_address_offset = output.offset;
+      out->tile_swizzle = output.pipeBankXor;
+      out->width = output.unAlignedDims.width;
+      out->height = output.unAlignedDims.height;
+      out->num_levels = output.numMipLevels;
+      out->level = output.mipId;
+      out->valid = true;
+   } else {
+      out->valid = false;
+   }
+}
+
+static void
+gfx10_surface_compute_nbc_view(struct ac_addrlib *addrlib, const struct radeon_info *info,
+                            const struct radeon_surf *surf, const struct ac_surf_info *surf_info,
+                            unsigned level, unsigned layer, struct ac_surf_nbc_view *out)
+{
    ADDR2_COMPUTE_NONBLOCKCOMPRESSEDVIEW_INPUT input = {0};
    input.size = sizeof(ADDR2_COMPUTE_NONBLOCKCOMPRESSEDVIEW_INPUT);
    input.swizzleMode = surf->u.gfx9.swizzle_mode;
@@ -4014,6 +4116,21 @@ ac_surface_compute_nbc_view(struct ac_addrlib *addrlib, const struct radeon_info
       out->valid = true;
    } else {
       out->valid = false;
+   }
+}
+
+void
+ac_surface_compute_nbc_view(struct ac_addrlib *addrlib, const struct radeon_info *info,
+                            const struct radeon_surf *surf, const struct ac_surf_info *surf_info,
+                            unsigned level, unsigned layer, struct ac_surf_nbc_view *out)
+{
+   /* Only implemented for GFX10+ */
+   assert(info->gfx_level >= GFX10);
+
+   if (info->gfx_level >= GFX12) {
+      gfx12_surface_compute_nbc_view(addrlib, info, surf, surf_info, level, layer, out);
+   } else {
+      gfx10_surface_compute_nbc_view(addrlib, info, surf, surf_info, level, layer, out);
    }
 }
 
@@ -4302,121 +4419,4 @@ nir_def *ac_nir_htile_addr_from_coord(nir_builder *b, const struct radeon_info *
    return gfx10_nir_meta_addr_from_coord(b, info, equation, -4, 2,
                                             htile_pitch, htile_slice_size,
                                             x, y, z, pipe_xor, NULL);
-}
-
-unsigned ac_get_cb_number_type(enum pipe_format format)
-{
-   const struct util_format_description *desc = util_format_description(format);
-   int chan = util_format_get_first_non_void_channel(format);
-
-   if (chan == -1 || desc->channel[chan].type == UTIL_FORMAT_TYPE_FLOAT) {
-      return V_028C70_NUMBER_FLOAT;
-   } else {
-      if (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB) {
-         return V_028C70_NUMBER_SRGB;
-      } else if (desc->channel[chan].type == UTIL_FORMAT_TYPE_SIGNED) {
-         return desc->channel[chan].pure_integer ? V_028C70_NUMBER_SINT : V_028C70_NUMBER_SNORM;
-      } else if (desc->channel[chan].type == UTIL_FORMAT_TYPE_UNSIGNED) {
-         return desc->channel[chan].pure_integer ? V_028C70_NUMBER_UINT : V_028C70_NUMBER_UNORM;
-      } else {
-         return V_028C70_NUMBER_UNORM;
-      }
-   }
-}
-
-unsigned ac_get_cb_format(enum amd_gfx_level gfx_level, enum pipe_format format)
-{
-   const struct util_format_description *desc = util_format_description(format);
-
-#define HAS_SIZE(x, y, z, w)                                                                       \
-   (desc->channel[0].size == (x) && desc->channel[1].size == (y) &&                                \
-    desc->channel[2].size == (z) && desc->channel[3].size == (w))
-
-   if (format == PIPE_FORMAT_R11G11B10_FLOAT) /* isn't plain */
-      return V_028C70_COLOR_10_11_11;
-
-   if (gfx_level >= GFX10_3 &&
-       format == PIPE_FORMAT_R9G9B9E5_FLOAT) /* isn't plain */
-      return V_028C70_COLOR_5_9_9_9;
-
-   if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN)
-      return V_028C70_COLOR_INVALID;
-
-   /* hw cannot support mixed formats (except depth/stencil, since
-    * stencil is not written to). */
-   if (desc->is_mixed && desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS)
-      return V_028C70_COLOR_INVALID;
-
-   int first_non_void = util_format_get_first_non_void_channel(format);
-
-   /* Reject SCALED formats because we don't implement them for CB. */
-   if (first_non_void >= 0 && first_non_void <= 3 &&
-       (desc->channel[first_non_void].type == UTIL_FORMAT_TYPE_UNSIGNED ||
-        desc->channel[first_non_void].type == UTIL_FORMAT_TYPE_SIGNED) &&
-       !desc->channel[first_non_void].normalized &&
-       !desc->channel[first_non_void].pure_integer)
-      return V_028C70_COLOR_INVALID;
-
-   switch (desc->nr_channels) {
-   case 1:
-      switch (desc->channel[0].size) {
-      case 8:
-         return V_028C70_COLOR_8;
-      case 16:
-         return V_028C70_COLOR_16;
-      case 32:
-         return V_028C70_COLOR_32;
-      case 64:
-         return V_028C70_COLOR_32_32;
-      }
-      break;
-   case 2:
-      if (desc->channel[0].size == desc->channel[1].size) {
-         switch (desc->channel[0].size) {
-         case 8:
-            return V_028C70_COLOR_8_8;
-         case 16:
-            return V_028C70_COLOR_16_16;
-         case 32:
-            return V_028C70_COLOR_32_32;
-         }
-      } else if (HAS_SIZE(8, 24, 0, 0)) {
-         return V_028C70_COLOR_24_8;
-      } else if (HAS_SIZE(24, 8, 0, 0)) {
-         return V_028C70_COLOR_8_24;
-      }
-      break;
-   case 3:
-      if (HAS_SIZE(5, 6, 5, 0)) {
-         return V_028C70_COLOR_5_6_5;
-      } else if (HAS_SIZE(32, 8, 24, 0)) {
-         return V_028C70_COLOR_X24_8_32_FLOAT;
-      }
-      break;
-   case 4:
-      if (desc->channel[0].size == desc->channel[1].size &&
-          desc->channel[0].size == desc->channel[2].size &&
-          desc->channel[0].size == desc->channel[3].size) {
-         switch (desc->channel[0].size) {
-         case 4:
-            return V_028C70_COLOR_4_4_4_4;
-         case 8:
-            return V_028C70_COLOR_8_8_8_8;
-         case 16:
-            return V_028C70_COLOR_16_16_16_16;
-         case 32:
-            return V_028C70_COLOR_32_32_32_32;
-         }
-      } else if (HAS_SIZE(5, 5, 5, 1)) {
-         return V_028C70_COLOR_1_5_5_5;
-      } else if (HAS_SIZE(1, 5, 5, 5)) {
-         return V_028C70_COLOR_5_5_5_1;
-      } else if (HAS_SIZE(10, 10, 10, 2)) {
-         return V_028C70_COLOR_2_10_10_10;
-      } else if (HAS_SIZE(2, 10, 10, 10)) {
-         return V_028C70_COLOR_10_10_10_2;
-      }
-      break;
-   }
-   return V_028C70_COLOR_INVALID;
 }

@@ -424,6 +424,14 @@ option(
 )
 
 option(
+  'amd-use-llvm',
+  type : 'boolean',
+  value : true,
+  description : 'Whether to use LLVM for the AMD drivers, if LLVM ' +
+                'is included.'
+)
+
+option(
   'valgrind',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},
@@ -473,6 +481,20 @@ option(
   value : false,
   description : 'Build and install Intel unit tests which require the GPU. ' +
                 'This option is for developers and the Intel CI system only.'
+)
+
+option(
+  'html-docs',
+  type : 'feature',
+  value : 'disabled',
+  description : 'Build HTML documentation.'
+)
+
+option(
+  'html-docs-path',
+  type : 'string',
+  value : '',
+  description : 'Location to install HTML documentation. Default: $datadir/doc/mesa.'
 )
 
 option(

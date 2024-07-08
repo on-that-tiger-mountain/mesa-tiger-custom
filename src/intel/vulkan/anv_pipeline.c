@@ -29,6 +29,7 @@
 
 #include "util/mesa-sha1.h"
 #include "util/os_time.h"
+#include "common/intel_compute_slm.h"
 #include "common/intel_l3_config.h"
 #include "common/intel_sample_positions.h"
 #include "compiler/brw_disasm.h"
@@ -778,7 +779,7 @@ anv_pipeline_hash_ray_tracing_combined_shader(struct anv_ray_tracing_pipeline *p
    _mesa_sha1_final(&ctx, sha1_out);
 }
 
-static nir_shader *
+static VkResult
 anv_pipeline_stage_get_nir(struct anv_pipeline *pipeline,
                            struct vk_pipeline_cache *cache,
                            void *mem_ctx,
@@ -788,25 +789,35 @@ anv_pipeline_stage_get_nir(struct anv_pipeline *pipeline,
       pipeline->device->physical->compiler;
    const nir_shader_compiler_options *nir_options =
       compiler->nir_options[stage->stage];
-   nir_shader *nir;
 
-   nir = anv_device_search_for_nir(pipeline->device, cache,
-                                   nir_options,
-                                   stage->shader_sha1,
-                                   mem_ctx);
-   if (nir) {
-      assert(nir->info.stage == stage->stage);
-      return nir;
+   stage->nir = anv_device_search_for_nir(pipeline->device, cache,
+                                          nir_options,
+                                          stage->shader_sha1,
+                                          mem_ctx);
+   if (stage->nir) {
+      assert(stage->nir->info.stage == stage->stage);
+      return VK_SUCCESS;
    }
 
-   nir = anv_shader_stage_to_nir(pipeline->device, stage->info,
-                                 stage->key.base.robust_flags, mem_ctx);
-   if (nir) {
-      anv_device_upload_nir(pipeline->device, cache, nir, stage->shader_sha1);
-      return nir;
+   /* VkPipelineShaderStageCreateInfo:
+    *
+    *    "If a pipeline is not found, pipeline compilation is not possible and
+    *     the implementation must fail as specified by
+    *     VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT."
+    */
+   if (vk_pipeline_shader_stage_has_identifier(stage->info))
+      return VK_PIPELINE_COMPILE_REQUIRED;
+
+   stage->nir = anv_shader_stage_to_nir(pipeline->device, stage->info,
+                                        stage->key.base.robust_flags, mem_ctx);
+   if (stage->nir) {
+      anv_device_upload_nir(pipeline->device, cache,
+                            stage->nir, stage->shader_sha1);
+      return VK_SUCCESS;
    }
 
-   return NULL;
+   return vk_errorf(&pipeline->device->vk, VK_ERROR_UNKNOWN,
+                    "Unable to load NIR");
 }
 
 static const struct vk_ycbcr_conversion_state *
@@ -959,7 +970,7 @@ print_tex_handle(nir_builder *b,
 
    nir_tex_instr *tex = nir_instr_as_tex(instr);
 
-   nir_src tex_src;
+   nir_src tex_src = {};
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       if (tex->src[i].src_type == nir_tex_src_texture_handle)
          tex_src = tex->src[i].src;
@@ -1006,7 +1017,6 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
    if (nir->info.stage == MESA_SHADER_MESH ||
          nir->info.stage == MESA_SHADER_TASK) {
       nir_lower_compute_system_values_options options = {
-            .lower_cs_local_id_to_index = true,
             .lower_workgroup_id_to_index = true,
             /* nir_lower_idiv generates expensive code */
             .shortcut_1d_workgroup_id = compiler->devinfo->verx10 >= 125,
@@ -1152,7 +1162,7 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
          const unsigned chunk_size = 16;
          const unsigned shared_size = ALIGN(nir->info.shared_size, chunk_size);
          assert(shared_size <=
-                intel_calculate_slm_size(compiler->devinfo->ver, nir->info.shared_size));
+                intel_compute_slm_calculate_size(compiler->devinfo->ver, nir->info.shared_size));
 
          NIR_PASS(_, nir, nir_zero_initialize_shared_memory,
                   shared_size, chunk_size);
@@ -1173,8 +1183,7 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
 #if DEBUG_PRINTF_EXAMPLE
    if (stage->stage == MESA_SHADER_FRAGMENT) {
       nir_shader_intrinsics_pass(nir, print_ubo_load,
-                                 nir_metadata_block_index |
-                                 nir_metadata_dominance,
+                                 nir_metadata_control_flow,
                                  NULL);
    }
 #endif
@@ -2026,10 +2035,10 @@ anv_graphics_pipeline_load_nir(struct anv_graphics_base_pipeline *pipeline,
        * an imported library for the same stage.
        */
       if (stages[s].imported.bin == NULL) {
-         stages[s].nir = anv_pipeline_stage_get_nir(&pipeline->base, cache,
-                                                    mem_ctx, &stages[s]);
-         if (stages[s].nir == NULL)
-            return vk_error(pipeline, VK_ERROR_UNKNOWN);
+         VkResult result = anv_pipeline_stage_get_nir(&pipeline->base, cache,
+                                                      mem_ctx, &stages[s]);
+         if (result != VK_SUCCESS)
+            return result;
       } else {
          stages[s].nir = need_clone ?
                          nir_shader_clone(mem_ctx, stages[s].imported.nir) :
@@ -2232,9 +2241,9 @@ anv_graphics_pipeline_compile(struct anv_graphics_base_pipeline *pipeline,
                vk_perf(VK_LOG_OBJS(cache ? &cache->base :
                                    &pipeline->base.device->vk.base),
                        "Found all ISA shaders in the cache but not all NIR shaders.");
+            } else {
+               anv_graphics_lib_retain_shaders(pipeline, stages, false /* will_compile */);
             }
-
-            anv_graphics_lib_retain_shaders(pipeline, stages, false /* will_compile */);
          }
 
          if (result == VK_SUCCESS)
@@ -2482,7 +2491,7 @@ anv_graphics_pipeline_compile(struct anv_graphics_base_pipeline *pipeline,
          goto fail;
       }
 
-      anv_nir_validate_push_layout(&stage->prog_data.base,
+      anv_nir_validate_push_layout(device->physical, &stage->prog_data.base,
                                    &stage->bind_map);
 
       struct anv_shader_upload_params upload_params = {
@@ -2637,10 +2646,11 @@ anv_pipeline_compile_cs(struct anv_compute_pipeline *pipeline,
          .binding = UINT32_MAX,
       };
 
-      stage.nir = anv_pipeline_stage_get_nir(&pipeline->base, cache, mem_ctx, &stage);
-      if (stage.nir == NULL) {
+      VkResult result = anv_pipeline_stage_get_nir(&pipeline->base, cache,
+                                                   mem_ctx, &stage);
+      if (result != VK_SUCCESS) {
          ralloc_free(mem_ctx);
-         return vk_error(pipeline, VK_ERROR_UNKNOWN);
+         return result;
       }
 
       anv_pipeline_nir_preprocess(&pipeline->base, &stage);
@@ -2670,7 +2680,8 @@ anv_pipeline_compile_cs(struct anv_compute_pipeline *pipeline,
          return vk_error(pipeline, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
 
-      anv_nir_validate_push_layout(&stage.prog_data.base, &stage.bind_map);
+      anv_nir_validate_push_layout(device->physical, &stage.prog_data.base,
+                                   &stage.bind_map);
 
       if (!stage.prog_data.cs.uses_num_work_groups) {
          assert(stage.bind_map.surface_to_descriptor[0].set ==
@@ -2804,20 +2815,12 @@ VkResult anv_CreateComputePipelines(
                                                  &pCreateInfos[i],
                                                  pAllocator, &pPipelines[i]);
 
-      if (res == VK_SUCCESS)
-         continue;
-
-      /* Bail out on the first error != VK_PIPELINE_COMPILE_REQUIRED as it
-       * is not obvious what error should be report upon 2 different failures.
-       * */
-      result = res;
-      if (res != VK_PIPELINE_COMPILE_REQUIRED)
-         break;
-
-      pPipelines[i] = VK_NULL_HANDLE;
-
-      if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
-         break;
+      if (res != VK_SUCCESS) {
+         result = res;
+         if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
+            break;
+         pPipelines[i] = VK_NULL_HANDLE;
+      }
    }
 
    for (; i < count; i++)
@@ -3298,20 +3301,12 @@ VkResult anv_CreateGraphicsPipelines(
                                             pAllocator, &pPipelines[i]);
       }
 
-      if (res == VK_SUCCESS)
-         continue;
-
-      /* Bail out on the first error != VK_PIPELINE_COMPILE_REQUIRED as it
-       * is not obvious what error should be report upon 2 different failures.
-       * */
-      result = res;
-      if (res != VK_PIPELINE_COMPILE_REQUIRED)
-         break;
-
-      pPipelines[i] = VK_NULL_HANDLE;
-
-      if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
-         break;
+      if (res != VK_SUCCESS) {
+         result = res;
+         if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
+            break;
+         pPipelines[i] = VK_NULL_HANDLE;
+      }
    }
 
    for (; i < count; i++)
@@ -3634,10 +3629,11 @@ anv_pipeline_compile_ray_tracing(struct anv_ray_tracing_pipeline *pipeline,
 
       int64_t stage_start = os_time_get_nano();
 
-      stages[i].nir = anv_pipeline_stage_get_nir(&pipeline->base, cache,
-                                                 tmp_pipeline_ctx, &stages[i]);
-      if (stages[i].nir == NULL)
-         return vk_error(pipeline, VK_ERROR_OUT_OF_HOST_MEMORY);
+      VkResult result = anv_pipeline_stage_get_nir(&pipeline->base, cache,
+                                                   tmp_pipeline_ctx,
+                                                   &stages[i]);
+      if (result != VK_SUCCESS)
+         return result;
 
       anv_pipeline_nir_preprocess(&pipeline->base, &stages[i]);
 
@@ -4146,19 +4142,12 @@ anv_CreateRayTracingPipelinesKHR(
                                                      &pCreateInfos[i],
                                                      pAllocator, &pPipelines[i]);
 
-      if (res == VK_SUCCESS)
-         continue;
-
-      /* Bail out on the first error as it is not obvious what error should be
-       * report upon 2 different failures. */
-      result = res;
-      if (result != VK_PIPELINE_COMPILE_REQUIRED)
-         break;
-
-      pPipelines[i] = VK_NULL_HANDLE;
-
-      if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
-         break;
+      if (res != VK_SUCCESS) {
+         result = res;
+         if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
+            break;
+         pPipelines[i] = VK_NULL_HANDLE;
+      }
    }
 
    for (; i < createInfoCount; i++)

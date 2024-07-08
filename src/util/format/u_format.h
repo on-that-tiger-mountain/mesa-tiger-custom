@@ -263,7 +263,7 @@ struct util_format_pack_description {
                       unsigned width, unsigned height);
 
    /**
-    * Pack pixels from Z32_FLOAT.
+    * Pack pixels from Z32_UNORM.
     * Note: strides are in bytes.
     *
     * Only defined for depth formats.
@@ -1808,6 +1808,8 @@ util_format_get_array(const enum util_format_type type, const unsigned bits,
 unsigned util_format_get_last_component(enum pipe_format format);
 int util_format_get_largest_non_void_channel(enum pipe_format format);
 unsigned util_format_get_max_channel_size(enum pipe_format format);
+
+uint32_t util_format_get_tilesize(enum pipe_format format, uint32_t dimensions, uint32_t samples, uint32_t axis);
 
 #ifdef __cplusplus
 } // extern "C" {

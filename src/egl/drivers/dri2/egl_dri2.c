@@ -835,16 +835,18 @@ dri2_setup_screen(_EGLDisplay *disp)
          disp->Extensions.MESA_drm_image =
             (capabilities & __DRI_IMAGE_CAP_GLOBAL_NAMES) != 0;
 
-         if (dri2_dpy->image->base.version >= 11)
-            disp->Extensions.MESA_image_dma_buf_export = EGL_TRUE;
       } else {
          disp->Extensions.MESA_drm_image = EGL_TRUE;
-         if (dri2_dpy->image->base.version >= 11)
-            disp->Extensions.MESA_image_dma_buf_export = EGL_TRUE;
       }
-
+#ifdef HAVE_LIBDRM
+      if (dri2_dpy->image->base.version >= 11 &&
+          get_screen_param(disp, PIPE_CAP_DMABUF) & DRM_PRIME_CAP_EXPORT) {
+         disp->Extensions.MESA_image_dma_buf_export = true;
+      }
+#endif
       disp->Extensions.MESA_x11_native_visual_id = EGL_TRUE;
 
+      disp->Extensions.EXT_surface_compression = EGL_TRUE;
       disp->Extensions.KHR_image_base = EGL_TRUE;
       disp->Extensions.KHR_gl_renderbuffer_image = EGL_TRUE;
       disp->Extensions.KHR_gl_texture_2D_image = EGL_TRUE;
@@ -1161,12 +1163,9 @@ dri2_display_destroy(_EGLDisplay *disp)
    free(dri2_dpy->device_name);
 #endif
 
-#ifdef HAVE_ANDROID_PLATFORM
-   u_gralloc_destroy(&dri2_dpy->gralloc);
-#endif
-
    switch (disp->Platform) {
    case _EGL_PLATFORM_X11:
+   case _EGL_PLATFORM_XCB:
       dri2_teardown_x11(dri2_dpy);
       break;
    case _EGL_PLATFORM_DRM:
@@ -1175,8 +1174,17 @@ dri2_display_destroy(_EGLDisplay *disp)
    case _EGL_PLATFORM_WAYLAND:
       dri2_teardown_wayland(dri2_dpy);
       break;
+   case _EGL_PLATFORM_ANDROID:
+#ifdef HAVE_ANDROID_PLATFORM
+      u_gralloc_destroy(&dri2_dpy->gralloc);
+#endif
+      break;
+   case _EGL_PLATFORM_SURFACELESS:
+      break;
+   case _EGL_PLATFORM_DEVICE:
+      break;
    default:
-      /* TODO: add teardown for other platforms */
+      unreachable("Platform teardown is not properly hooked.");
       break;
    }
 
@@ -2440,7 +2448,7 @@ dri2_create_image_mesa_drm_buffer(_EGLDisplay *disp, _EGLContext *ctx,
 
    switch (attrs.DRMBufferFormatMESA) {
    case EGL_DRM_BUFFER_FORMAT_ARGB32_MESA:
-      format = PIPE_FORMAT_B8G8R8A8_UNORM;
+      format = PIPE_FORMAT_BGRA8888_UNORM;
       pitch = attrs.DRMBufferStrideMESA;
       break;
    default:
@@ -2893,7 +2901,7 @@ dri2_create_drm_image_mesa(_EGLDisplay *disp, const EGLint *attr_list)
 
    switch (attrs.DRMBufferFormatMESA) {
    case EGL_DRM_BUFFER_FORMAT_ARGB32_MESA:
-      format = PIPE_FORMAT_B8G8R8A8_UNORM;
+      format = PIPE_FORMAT_BGRA8888_UNORM;
       break;
    default:
       _eglError(EGL_BAD_PARAMETER, __func__);
@@ -3644,6 +3652,33 @@ dri2_interop_flush_objects(_EGLDisplay *disp, _EGLContext *ctx, unsigned count,
                                            objects, out);
 }
 
+static EGLBoolean
+dri2_query_supported_compression_rates(_EGLDisplay *disp, _EGLConfig *config,
+                                       const EGLAttrib *attr_list,
+                                       EGLint *rates, EGLint rate_size,
+                                       EGLint *num_rate)
+{
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   struct dri2_egl_config *conf = dri2_egl_config(config);
+   enum __DRIFixedRateCompression dri_rates[rate_size];
+
+   if (dri2_dpy->image->base.version >= 22 &&
+       dri2_dpy->image->queryCompressionRates) {
+      const __DRIconfig *dri_conf =
+         dri2_get_dri_config(conf, EGL_WINDOW_BIT, EGL_GL_COLORSPACE_LINEAR);
+      if (!dri2_dpy->image->queryCompressionRates(
+             dri2_dpy->dri_screen_render_gpu, dri_conf, rate_size, dri_rates,
+             num_rate))
+         return EGL_FALSE;
+
+      for (int i = 0; i < *num_rate && i < rate_size; ++i)
+         rates[i] = dri_rates[i];
+      return EGL_TRUE;
+   }
+   *num_rate = 0;
+   return EGL_TRUE;
+}
+
 const _EGLDriver _eglDriver = {
    .Initialize = dri2_initialize,
    .Terminate = dri2_terminate,
@@ -3697,4 +3732,5 @@ const _EGLDriver _eglDriver = {
    .GLInteropFlushObjects = dri2_interop_flush_objects,
    .DupNativeFenceFDANDROID = dri2_dup_native_fence_fd,
    .SetBlobCacheFuncsANDROID = dri2_set_blob_cache_funcs,
+   .QuerySupportedCompressionRatesEXT = dri2_query_supported_compression_rates,
 };

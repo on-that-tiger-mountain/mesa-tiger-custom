@@ -365,6 +365,7 @@ nir_intrinsic_writes_external_memory(const nir_intrinsic_instr *instr)
    case nir_intrinsic_ssbo_atomic_ir3:
    case nir_intrinsic_ssbo_atomic_swap_ir3:
    case nir_intrinsic_store_global:
+   case nir_intrinsic_store_global_etna:
    case nir_intrinsic_store_global_ir3:
    case nir_intrinsic_store_global_amd:
    case nir_intrinsic_store_ssbo:
@@ -466,10 +467,6 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader,
    switch (instr->intrinsic) {
    case nir_intrinsic_demote:
    case nir_intrinsic_demote_if:
-      shader->info.fs.uses_demote = true;
-      FALLTHROUGH; /* quads with helper lanes only might be discarded entirely */
-   case nir_intrinsic_discard:
-   case nir_intrinsic_discard_if:
    case nir_intrinsic_terminate:
    case nir_intrinsic_terminate_if:
       /* Freedreno uses discard_if() to end GS invocations that don't produce
@@ -1003,7 +1000,6 @@ nir_shader_gather_info(nir_shader *shader, nir_function_impl *entrypoint)
    if (shader->info.stage == MESA_SHADER_FRAGMENT) {
       shader->info.fs.uses_sample_qualifier = false;
       shader->info.fs.uses_discard = false;
-      shader->info.fs.uses_demote = false;
       shader->info.fs.color_is_dual_source = false;
       shader->info.fs.uses_fbfetch_output = false;
       shader->info.fs.needs_quad_helper_invocations = false;

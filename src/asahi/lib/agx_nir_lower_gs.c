@@ -360,9 +360,8 @@ lower_prolog_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 bool
 agx_nir_lower_sw_vs_id(nir_shader *s)
 {
-   return nir_shader_intrinsics_pass(
-      s, lower_prolog_id, nir_metadata_dominance | nir_metadata_block_index,
-      NULL);
+   return nir_shader_intrinsics_pass(s, lower_prolog_id,
+                                     nir_metadata_control_flow, NULL);
 }
 
 static bool
@@ -379,10 +378,7 @@ lower_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       id = load_geometry_param(b, flat_outputs);
    else if (intr->intrinsic == nir_intrinsic_load_input_topology_agx)
       id = load_geometry_param(b, input_topology);
-   else if (intr->intrinsic == nir_intrinsic_load_provoking_last) {
-      id = nir_b2b32(
-         b, libagx_is_provoking_last(b, nir_load_input_assembly_buffer_agx(b)));
-   } else
+   else
       return false;
 
    b->cursor = nir_instr_remove(&intr->instr);
@@ -412,10 +408,10 @@ agx_nir_create_geometry_count_shader(nir_shader *gs, const nir_shader *libagx,
    }
 
    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_gs_count_instr,
-            nir_metadata_block_index | nir_metadata_dominance, state);
+            nir_metadata_control_flow, state);
 
    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_id,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
 
    agx_preprocess_nir(shader, libagx);
    return shader;
@@ -491,11 +487,127 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 /*
+ * Side effects in geometry shaders are problematic with our "GS rasterization
+ * shader" implementation. Where does the side effect happen? In the prepass?
+ * In the rast shader? In both?
+ *
+ * A perfect solution is impossible with rast shaders. Since the spec is loose
+ * here, we follow the principle of "least surprise":
+ *
+ * 1. Prefer side effects in the prepass over the rast shader. The prepass runs
+ *    once per API GS invocation so will match the expectations of buggy apps
+ *    not written for tilers.
+ *
+ * 2. If we must execute any side effect in the rast shader, try to execute all
+ *    side effects only in the rast shader. If some side effects must happen in
+ *    the rast shader and others don't, this gets consistent counts
+ *    (i.e. if the app expects plain stores and atomics to match up).
+ *
+ * 3. If we must execute side effects in both rast and the prepass,
+ *    execute all side effects in the rast shader and strip what we can from
+ *    the prepass. This gets the "unsurprising" behaviour from #2 without
+ *    falling over for ridiculous uses of atomics.
+ */
+static bool
+strip_side_effect_from_rast(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_global:
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+
+   /* If there's a side effect that's actually required, keep it. */
+   if (nir_intrinsic_infos[intr->intrinsic].has_dest &&
+       !list_is_empty(&intr->def.uses)) {
+
+      bool *any = data;
+      *any = true;
+      return false;
+   }
+
+   /* Otherwise, remove the dead instruction. */
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+strip_side_effects_from_rast(nir_shader *s, bool *side_effects_for_rast)
+{
+   bool progress, any;
+
+   /* Rather than complex analysis, clone and try to remove as many side effects
+    * as possible. Then we check if we removed them all. We need to loop to
+    * handle complex control flow with side effects, where we can strip
+    * everything but can't figure that out with a simple one-shot analysis.
+    */
+   nir_shader *clone = nir_shader_clone(NULL, s);
+
+   /* Drop as much as we can */
+   do {
+      progress = false;
+      any = false;
+      NIR_PASS(progress, clone, nir_shader_intrinsics_pass,
+               strip_side_effect_from_rast, nir_metadata_control_flow, &any);
+
+      NIR_PASS(progress, clone, nir_opt_dce);
+      NIR_PASS(progress, clone, nir_opt_dead_cf);
+   } while (progress);
+
+   ralloc_free(clone);
+
+   /* If we need atomics, leave them in */
+   if (any) {
+      *side_effects_for_rast = true;
+      return false;
+   }
+
+   /* Else strip it all */
+   do {
+      progress = false;
+      any = false;
+      NIR_PASS(progress, s, nir_shader_intrinsics_pass,
+               strip_side_effect_from_rast, nir_metadata_control_flow, &any);
+
+      NIR_PASS(progress, s, nir_opt_dce);
+      NIR_PASS(progress, s, nir_opt_dead_cf);
+   } while (progress);
+
+   assert(!any);
+   return progress;
+}
+
+static bool
+strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+
+   if (list_is_empty(&intr->def.uses)) {
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   return false;
+}
+
+/*
  * Create a GS rasterization shader. This is a hardware vertex shader that
  * shades each rasterized output vertex in parallel.
  */
 static nir_shader *
-agx_nir_create_gs_rast_shader(const nir_shader *gs, const nir_shader *libagx)
+agx_nir_create_gs_rast_shader(const nir_shader *gs, const nir_shader *libagx,
+                              bool *side_effects_for_rast)
 {
    /* Don't muck up the original shader */
    nir_shader *shader = nir_shader_clone(NULL, gs);
@@ -519,6 +631,8 @@ agx_nir_create_gs_rast_shader(const nir_shader *gs, const nir_shader *libagx)
    nir_builder b_ =
       nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(shader)));
    nir_builder *b = &b_;
+
+   NIR_PASS(_, shader, strip_side_effects_from_rast, side_effects_for_rast);
 
    /* Optimize out pointless gl_PointSize outputs. Bizarrely, these occur. */
    if (shader->info.gs.output_primitive != MESA_PRIM_POINTS)
@@ -545,18 +659,22 @@ agx_nir_create_gs_rast_shader(const nir_shader *gs, const nir_shader *libagx)
       const char *slot_name =
          gl_varying_slot_name_for_stage(slot, MESA_SHADER_GEOMETRY);
 
+      bool scalar = (slot == VARYING_SLOT_PSIZ) ||
+                    (slot == VARYING_SLOT_LAYER) ||
+                    (slot == VARYING_SLOT_VIEWPORT);
+      unsigned comps = scalar ? 1 : 4;
+
       rast_state.outputs.outputs[slot] = nir_variable_create(
-         shader, nir_var_shader_temp, glsl_vector_type(GLSL_TYPE_UINT, 4),
+         shader, nir_var_shader_temp, glsl_vector_type(GLSL_TYPE_UINT, comps),
          ralloc_asprintf(shader, "%s-temp", slot_name));
 
       rast_state.selected.outputs[slot] = nir_variable_create(
-         shader, nir_var_shader_temp, glsl_vector_type(GLSL_TYPE_UINT, 4),
+         shader, nir_var_shader_temp, glsl_vector_type(GLSL_TYPE_UINT, comps),
          ralloc_asprintf(shader, "%s-selected", slot_name));
    }
 
    nir_shader_intrinsics_pass(shader, lower_to_gs_rast,
-                              nir_metadata_block_index | nir_metadata_dominance,
-                              &rast_state);
+                              nir_metadata_control_flow, &rast_state);
 
    b->cursor = nir_after_impl(b->impl);
 
@@ -568,8 +686,9 @@ agx_nir_create_gs_rast_shader(const nir_shader *gs, const nir_shader *libagx)
       /* We set NIR_COMPACT_ARRAYS so clip/cull distance needs to come all in
        * DIST0. Undo the offset if we need to.
        */
+      assert(slot != VARYING_SLOT_CULL_DIST1);
       unsigned offset = 0;
-      if (slot == VARYING_SLOT_CULL_DIST1 || slot == VARYING_SLOT_CLIP_DIST1)
+      if (slot == VARYING_SLOT_CLIP_DIST1)
          offset = 1;
 
       nir_store_output(b, value, nir_imm_int(b, offset),
@@ -893,7 +1012,7 @@ agx_nir_create_pre_gs(struct lower_gs_state *state, const nir_shader *libagx,
    /* Setup the draw from the rasterization stream (0). */
    if (!state->rasterizer_discard) {
       libagx_build_gs_draw(
-         b, nir_load_geometry_param_buffer_agx(b), nir_imm_bool(b, indexed),
+         b, nir_load_geometry_param_buffer_agx(b),
          previous_vertices(b, state, 0, unrolled_in_prims),
          restart ? previous_primitives(b, state, 0, unrolled_in_prims)
                  : nir_imm_int(b, 0));
@@ -1106,41 +1225,7 @@ agx_nir_lower_gs_instancing(nir_shader *gs)
 
    /* Use the loop counter as the invocation ID each iteration */
    nir_shader_intrinsics_pass(gs, rewrite_invocation_id,
-                              nir_metadata_block_index | nir_metadata_dominance,
-                              index);
-}
-
-static bool
-strip_side_effects(nir_builder *b, nir_intrinsic_instr *intr, void *_)
-{
-   switch (intr->intrinsic) {
-   case nir_intrinsic_store_global:
-   case nir_intrinsic_global_atomic:
-   case nir_intrinsic_global_atomic_swap:
-      break;
-   default:
-      return false;
-   }
-
-   /* If there's a side effect that's actually required for the prepass, we have
-    * to keep it in.
-    */
-   if (nir_intrinsic_infos[intr->intrinsic].has_dest &&
-       !list_is_empty(&intr->def.uses))
-      return false;
-
-   /* Do not strip transform feedback stores, the rasterization shader doesn't
-    * execute them.
-    */
-   if (intr->intrinsic == nir_intrinsic_store_global &&
-       nir_intrinsic_access(intr) & ACCESS_XFB)
-      return false;
-
-   /* Otherwise, remove the dead instruction. The rasterization shader will
-    * execute the side effect so the side effect still happens at least once.
-    */
-   nir_instr_remove(&intr->instr);
-   return true;
+                              nir_metadata_control_flow, index);
 }
 
 static void
@@ -1152,8 +1237,7 @@ link_libagx(nir_shader *nir, const nir_shader *libagx)
    NIR_PASS(_, nir, nir_lower_indirect_derefs, nir_var_function_temp, 64);
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
-            nir_var_shader_temp | nir_var_function_temp | nir_var_mem_shared |
-               nir_var_mem_global,
+            nir_var_shader_temp | nir_var_function_temp | nir_var_mem_shared,
             glsl_get_cl_type_size_align);
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -1194,13 +1278,12 @@ agx_nir_lower_gs(nir_shader *gs, const nir_shader *libagx,
       nir_function_impl *impl = nir_shader_get_entrypoint(gs);
       nir_builder b = nir_builder_at(nir_before_impl(impl));
 
-      nir_shader_intrinsics_pass(
-         gs, rewrite_invocation_id,
-         nir_metadata_block_index | nir_metadata_dominance, nir_imm_int(&b, 0));
+      nir_shader_intrinsics_pass(gs, rewrite_invocation_id,
+                                 nir_metadata_control_flow, nir_imm_int(&b, 0));
    }
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_inputs,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
 
    /* Lower geometry shader writes to contain all of the required counts, so we
     * know where in the various buffers we should write vertices.
@@ -1257,10 +1340,11 @@ agx_nir_lower_gs(nir_shader *gs, const nir_shader *libagx,
       }
    }
 
-   *gs_copy = agx_nir_create_gs_rast_shader(gs, libagx);
+   bool side_effects_for_rast = false;
+   *gs_copy = agx_nir_create_gs_rast_shader(gs, libagx, &side_effects_for_rast);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
 
    link_libagx(gs, libagx);
 
@@ -1280,6 +1364,14 @@ agx_nir_lower_gs(nir_shader *gs, const nir_shader *libagx,
    struct agx_lower_output_to_var_state state = {0};
 
    u_foreach_bit64(slot, gs->info.outputs_written) {
+      /* After enough optimizations, the shader metadata can go out of sync, fix
+       * with our gathered info. Otherwise glsl_vector_type will assert fail.
+       */
+      if (component_counts[slot] == 0) {
+         gs->info.outputs_written &= ~BITFIELD64_BIT(slot);
+         continue;
+      }
+
       const char *slot_name =
          gl_varying_slot_name_for_stage(slot, MESA_SHADER_GEOMETRY);
 
@@ -1294,7 +1386,7 @@ agx_nir_lower_gs(nir_shader *gs, const nir_shader *libagx,
    }
 
    NIR_PASS(_, gs, nir_shader_instructions_pass, agx_lower_output_to_var,
-            nir_metadata_block_index | nir_metadata_dominance, &state);
+            nir_metadata_control_flow, &state);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
             nir_metadata_none, &gs_state);
@@ -1322,15 +1414,19 @@ agx_nir_lower_gs(nir_shader *gs, const nir_shader *libagx,
       NIR_PASS(progress, gs, nir_opt_dce);
       NIR_PASS(progress, gs, nir_opt_loop_unroll);
 
-      /* When rasterizing, we try to move side effects to the rasterizer shader
-       * and strip the prepass of the dead side effects. Run this in the opt
-       * loop because it interacts with nir_opt_dce.
-       */
-      if (rasterizes_at_least_one_vertex) {
-         NIR_PASS(progress, gs, nir_shader_intrinsics_pass, strip_side_effects,
-                  nir_metadata_block_index | nir_metadata_dominance, NULL);
-      }
    } while (progress);
+
+   /* When rasterizing, we try to handle side effects sensibly. */
+   if (rasterizes_at_least_one_vertex && side_effects_for_rast) {
+      do {
+         progress = false;
+         NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
+                  strip_side_effect_from_main, nir_metadata_control_flow, NULL);
+
+         NIR_PASS(progress, gs, nir_opt_dce);
+         NIR_PASS(progress, gs, nir_opt_dead_cf);
+      } while (progress);
+   }
 
    /* All those variables we created should've gone away by now */
    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);
@@ -1339,7 +1435,7 @@ agx_nir_lower_gs(nir_shader *gs, const nir_shader *libagx,
    NIR_PASS(_, gs, nir_opt_move, ~0);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
-            nir_metadata_block_index | nir_metadata_dominance, NULL);
+            nir_metadata_control_flow, NULL);
 
    /* Create auxiliary programs */
    *pre_gs = agx_nir_create_pre_gs(
@@ -1410,9 +1506,8 @@ agx_nir_lower_vs_before_gs(struct nir_shader *vs,
    bool progress = false;
 
    /* Lower vertex stores to memory stores */
-   progress |= nir_shader_intrinsics_pass(
-      vs, lower_vs_before_gs, nir_metadata_block_index | nir_metadata_dominance,
-      NULL);
+   progress |= nir_shader_intrinsics_pass(vs, lower_vs_before_gs,
+                                          nir_metadata_control_flow, NULL);
 
    /* Link libagx, used in lower_vs_before_gs */
    if (progress)
@@ -1444,10 +1539,7 @@ agx_nir_gs_setup_indirect(nir_builder *b, const void *data)
 {
    const struct agx_gs_setup_indirect_key *key = data;
 
-   libagx_gs_setup_indirect(b, nir_load_geometry_param_buffer_agx(b),
-                            nir_load_input_assembly_buffer_agx(b),
-                            nir_load_vs_output_buffer_ptr_agx(b),
-                            nir_load_vs_outputs_agx(b),
+   libagx_gs_setup_indirect(b, nir_load_preamble(b, 1, 64, .base = 0),
                             nir_imm_int(b, key->prim),
                             nir_channel(b, nir_load_local_invocation_id(b), 0));
 }
@@ -1455,10 +1547,10 @@ agx_nir_gs_setup_indirect(nir_builder *b, const void *data)
 void
 agx_nir_unroll_restart(nir_builder *b, const void *data)
 {
+   const struct agx_unroll_restart_key *key = data;
    b->shader->info.workgroup_size[0] = 1024;
 
-   const struct agx_unroll_restart_key *key = data;
-   nir_def *ia = nir_load_input_assembly_buffer_agx(b);
+   nir_def *ia = nir_load_preamble(b, 1, 64, .base = 0);
    nir_def *draw = nir_channel(b, nir_load_workgroup_id(b), 0);
    nir_def *lane = nir_channel(b, nir_load_local_invocation_id(b), 0);
    nir_def *mode = nir_imm_int(b, key->prim);

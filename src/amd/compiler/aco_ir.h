@@ -15,6 +15,7 @@
 
 #include "ac_binary.h"
 #include "ac_hw_stage.h"
+#include "ac_shader_util.h"
 #include "amd_family.h"
 #include <algorithm>
 #include <bitset>
@@ -30,7 +31,6 @@ extern uint64_t debug_flags;
 enum {
    DEBUG_VALIDATE_IR = 0x1,
    DEBUG_VALIDATE_RA = 0x2,
-   DEBUG_PERFWARN = 0x4,
    DEBUG_FORCE_WAITCNT = 0x8,
    DEBUG_NO_VN = 0x10,
    DEBUG_NO_OPT = 0x20,
@@ -179,7 +179,11 @@ enum wait_type {
    wait_type_vm = 2,
    /* GFX10+ */
    wait_type_vs = 3,
-   wait_type_num = 4,
+   /* GFX12+ */
+   wait_type_sample = 4,
+   wait_type_bvh = 5,
+   wait_type_km = 6,
+   wait_type_num = 7,
 };
 
 struct Instruction;
@@ -191,6 +195,9 @@ struct wait_imm {
    uint8_t lgkm;
    uint8_t vm;
    uint8_t vs;
+   uint8_t sample;
+   uint8_t bvh;
+   uint8_t km;
 
    wait_imm();
    wait_imm(uint16_t vm_, uint16_t exp_, uint16_t lgkm_, uint16_t vs_);
@@ -223,6 +230,9 @@ static_assert(offsetof(wait_imm, exp) == wait_type_exp);
 static_assert(offsetof(wait_imm, lgkm) == wait_type_lgkm);
 static_assert(offsetof(wait_imm, vm) == wait_type_vm);
 static_assert(offsetof(wait_imm, vs) == wait_type_vs);
+static_assert(offsetof(wait_imm, sample) == wait_type_sample);
+static_assert(offsetof(wait_imm, bvh) == wait_type_bvh);
+static_assert(offsetof(wait_imm, km) == wait_type_km);
 
 /* s_wait_event immediate bits. */
 enum wait_event_imm : uint16_t {
@@ -231,7 +241,8 @@ enum wait_event_imm : uint16_t {
     * their ordered sections (by performing the `done` export), and that the current wave may enter
     * its ordered section.
     */
-   wait_event_imm_dont_wait_export_ready = 0x1,
+   wait_event_imm_dont_wait_export_ready_gfx11 = 0x1,
+   wait_event_imm_wait_export_ready_gfx12 = 0x2,
 };
 
 constexpr Format
@@ -1299,11 +1310,7 @@ static_assert(sizeof(SALU_instruction) == sizeof(Instruction) + 4, "Unexpected p
  */
 struct SMEM_instruction : public Instruction {
    memory_sync_info sync;
-   bool glc : 1; /* VI+: globally coherent */
-   bool dlc : 1; /* NAVI: device level coherent */
-   bool nv : 1;  /* VEGA only: Non-volatile */
-   bool disable_wqm : 1;
-   uint8_t padding : 4;
+   ac_hw_cache_flags cache;
 };
 static_assert(sizeof(SMEM_instruction) == sizeof(Instruction) + 4, "Unexpected padding");
 
@@ -1482,19 +1489,16 @@ static_assert(sizeof(LDSDIR_instruction) == sizeof(Instruction) + 8, "Unexpected
  */
 struct MUBUF_instruction : public Instruction {
    memory_sync_info sync;
+   ac_hw_cache_flags cache;
    bool offen : 1;           /* Supply an offset from VGPR (VADDR) */
    bool idxen : 1;           /* Supply an index from VGPR (VADDR) */
    bool addr64 : 1;          /* SI, CIK: Address size is 64-bit */
-   bool glc : 1;             /* globally coherent */
-   bool dlc : 1;             /* NAVI: device level coherent */
-   bool slc : 1;             /* system level coherent */
    bool tfe : 1;             /* texture fail enable */
    bool lds : 1;             /* Return read-data to LDS instead of VGPRs */
-   uint16_t disable_wqm : 1; /* Require an exec mask without helper invocations */
-   uint16_t offset : 12;     /* Unsigned byte offset - 12 bit */
-   uint16_t swizzled : 1;
-   uint16_t padding0 : 2;
-   uint16_t padding1;
+   bool disable_wqm : 1;     /* Require an exec mask without helper invocations */
+   uint8_t padding0 : 2;
+   uint8_t padding1;
+   uint16_t offset; /* Unsigned byte offset - 12 bit */
 };
 static_assert(sizeof(MUBUF_instruction) == sizeof(Instruction) + 8, "Unexpected padding");
 
@@ -1508,16 +1512,14 @@ static_assert(sizeof(MUBUF_instruction) == sizeof(Instruction) + 8, "Unexpected 
  */
 struct MTBUF_instruction : public Instruction {
    memory_sync_info sync;
+   ac_hw_cache_flags cache;
    uint8_t dfmt : 4;         /* Data Format of data in memory buffer */
    uint8_t nfmt : 3;         /* Numeric format of data in memory */
    bool offen : 1;           /* Supply an offset from VGPR (VADDR) */
-   uint16_t idxen : 1;       /* Supply an index from VGPR (VADDR) */
-   uint16_t glc : 1;         /* globally coherent */
-   uint16_t dlc : 1;         /* NAVI: device level coherent */
-   uint16_t slc : 1;         /* system level coherent */
-   uint16_t tfe : 1;         /* texture fail enable */
-   uint16_t disable_wqm : 1; /* Require an exec mask without helper invocations */
-   uint16_t padding : 10;
+   bool idxen : 1;           /* Supply an index from VGPR (VADDR) */
+   bool tfe : 1;             /* texture fail enable */
+   bool disable_wqm : 1;     /* Require an exec mask without helper invocations */
+   uint8_t padding : 5;
    uint16_t offset; /* Unsigned byte offset - 12 bit */
 };
 static_assert(sizeof(MTBUF_instruction) == sizeof(Instruction) + 8, "Unexpected padding");
@@ -1533,12 +1535,10 @@ static_assert(sizeof(MTBUF_instruction) == sizeof(Instruction) + 8, "Unexpected 
  */
 struct MIMG_instruction : public Instruction {
    memory_sync_info sync;
+   ac_hw_cache_flags cache;
    uint8_t dmask;        /* Data VGPR enable mask */
    uint8_t dim : 3;      /* NAVI: dimensionality */
    bool unrm : 1;        /* Force address to be un-normalized */
-   bool dlc : 1;         /* NAVI: device level coherent */
-   bool glc : 1;         /* globally coherent */
-   bool slc : 1;         /* system level coherent */
    bool tfe : 1;         /* texture fail enable */
    bool da : 1;          /* declare an array */
    bool lwe : 1;         /* LOD warning enable */
@@ -1547,9 +1547,8 @@ struct MIMG_instruction : public Instruction {
    bool d16 : 1;         /* Convert 32-bit data to 16-bit data */
    bool disable_wqm : 1; /* Require an exec mask without helper invocations */
    bool strict_wqm : 1;  /* VADDR is a linear VGPR and additional VGPRs may be copied into it */
-   uint8_t padding0 : 1;
+   uint8_t padding0 : 4;
    uint8_t padding1;
-   uint8_t padding2;
 };
 static_assert(sizeof(MIMG_instruction) == sizeof(Instruction) + 8, "Unexpected padding");
 
@@ -1562,15 +1561,13 @@ static_assert(sizeof(MIMG_instruction) == sizeof(Instruction) + 8, "Unexpected p
  */
 struct FLAT_instruction : public Instruction {
    memory_sync_info sync;
-   bool slc : 1; /* system level coherent */
-   bool glc : 1; /* globally coherent */
-   bool dlc : 1; /* NAVI: device level coherent */
+   ac_hw_cache_flags cache;
    bool lds : 1;
    bool nv : 1;
    bool disable_wqm : 1; /* Require an exec mask without helper invocations */
-   uint8_t padding0 : 2;
+   uint8_t padding0 : 5;
+   uint8_t padding1;
    int16_t offset; /* Vega/Navi only */
-   uint16_t padding1;
 };
 static_assert(sizeof(FLAT_instruction) == sizeof(Instruction) + 8, "Unexpected padding");
 
@@ -1718,6 +1715,7 @@ is_phi(aco_ptr<Instruction>& instr)
    return is_phi(instr.get());
 }
 
+bool is_wait_export_ready(amd_gfx_level gfx_level, const Instruction* instr);
 memory_sync_info get_sync_info(const Instruction* instr);
 
 inline bool
@@ -1748,14 +1746,9 @@ aco_ptr<Instruction> convert_to_DPP(amd_gfx_level gfx_level, aco_ptr<Instruction
                                     bool dpp8);
 bool needs_exec_mask(const Instruction* instr);
 
-aco_opcode get_ordered(aco_opcode op);
-aco_opcode get_unordered(aco_opcode op);
-aco_opcode get_inverse(aco_opcode op);
-aco_opcode get_swapped(aco_opcode op);
-aco_opcode get_f32_cmp(aco_opcode op);
+aco_opcode get_vcmp_inverse(aco_opcode op);
+aco_opcode get_vcmp_swapped(aco_opcode op);
 aco_opcode get_vcmpx(aco_opcode op);
-unsigned get_cmp_bitsize(aco_opcode op);
-bool is_fp_cmp(aco_opcode op);
 bool is_cmpx(aco_opcode op);
 
 bool can_swap_operands(aco_ptr<Instruction>& instr, aco_opcode* new_op, unsigned idx0 = 0,
@@ -1770,6 +1763,17 @@ unsigned get_vopd_opy_start(const Instruction* instr);
 unsigned get_operand_size(aco_ptr<Instruction>& instr, unsigned index);
 
 bool should_form_clause(const Instruction* a, const Instruction* b);
+
+enum vmem_type : uint8_t {
+   vmem_nosampler = 1 << 0,
+   vmem_sampler = 1 << 1,
+   vmem_bvh = 1 << 2,
+};
+
+/* VMEM instructions of the same type return in-order. For GFX12+, this determines which counter
+ * is used.
+ */
+uint8_t get_vmem_type(enum amd_gfx_level gfx_level, Instruction* instr);
 
 enum block_kind {
    /* uniform indicates that leaving this block,
@@ -1878,6 +1882,7 @@ struct Block {
    edge_vec logical_succs;
    edge_vec linear_succs;
    RegisterDemand register_demand = RegisterDemand();
+   RegisterDemand live_in_demand = RegisterDemand();
    uint32_t kind = 0;
    int32_t logical_idom = -1;
    int32_t linear_idom = -1;
@@ -1991,6 +1996,7 @@ struct DeviceInfo {
    unsigned simd_per_cu;
    bool has_fast_fma32 = false;
    bool has_mac_legacy32 = false;
+   bool has_fmac_legacy32 = false;
    bool fused_mad_mix = false;
    bool xnack_enabled = false;
    bool sram_ecc_enabled = false;
@@ -2054,6 +2060,14 @@ public:
    bool pending_lds_access = false;
 
    struct {
+      monotonic_buffer_resource memory;
+      /* live temps out per block */
+      std::vector<IDSet> live_out;
+      /* register demand (sgpr/vgpr) per instruction per block */
+      std::vector<std::vector<RegisterDemand>> register_demand;
+   } live;
+
+   struct {
       FILE* output = stderr;
       bool shorten_messages = false;
       void (*func)(void* private_data, enum aco_compiler_debug_level level, const char* message);
@@ -2078,8 +2092,7 @@ public:
 
    uint32_t peekAllocationId() { return allocationID; }
 
-   friend void reindex_ssa(Program* program);
-   friend void reindex_ssa(Program* program, std::vector<IDSet>& live_out);
+   friend void reindex_ssa(Program* program, bool update_live_out);
 
    Block* create_and_insert_block()
    {
@@ -2100,13 +2113,6 @@ public:
 
 private:
    uint32_t allocationID = 1;
-};
-
-struct live {
-   /* live temps out per block */
-   std::vector<IDSet> live_out;
-   /* register demand (sgpr/vgpr) per instruction per block */
-   std::vector<std::vector<RegisterDemand>> register_demand;
 };
 
 struct ra_test_policy {
@@ -2148,7 +2154,7 @@ void lower_phis(Program* program);
 void lower_subdword(Program* program);
 void calc_min_waves(Program* program);
 void update_vgpr_sgpr_demand(Program* program, const RegisterDemand new_demand);
-live live_var_analysis(Program* program);
+void live_var_analysis(Program* program);
 std::vector<uint16_t> dead_code_analysis(Program* program);
 void dominator_tree(Program* program);
 void insert_exec_mask(Program* program);
@@ -2156,14 +2162,14 @@ void value_numbering(Program* program);
 void optimize(Program* program);
 void optimize_postRA(Program* program);
 void setup_reduce_temp(Program* program);
-void lower_to_cssa(Program* program, live& live_vars);
-void register_allocation(Program* program, live& live_vars, ra_test_policy = {});
+void lower_to_cssa(Program* program);
+void register_allocation(Program* program, ra_test_policy = {});
 void ssa_elimination(Program* program);
 void lower_to_hw_instr(Program* program);
-void schedule_program(Program* program, live& live_vars);
+void schedule_program(Program* program);
 void schedule_ilp(Program* program);
 void schedule_vopd(Program* program);
-void spill(Program* program, live& live_vars);
+void spill(Program* program);
 void insert_wait_states(Program* program);
 bool dealloc_vgprs(Program* program);
 void insert_NOPs(Program* program);
@@ -2179,13 +2185,6 @@ bool print_asm(Program* program, std::vector<uint32_t>& binary, unsigned exec_si
 bool validate_ir(Program* program);
 bool validate_cfg(Program* program);
 bool validate_ra(Program* program);
-#ifndef NDEBUG
-void perfwarn(Program* program, bool cond, const char* msg, Instruction* instr = NULL);
-#else
-#define perfwarn(program, cond, msg, ...)                                                          \
-   do {                                                                                            \
-   } while (0)
-#endif
 
 void collect_presched_stats(Program* program);
 void collect_preasm_stats(Program* program);
@@ -2213,13 +2212,9 @@ void aco_print_operand(const Operand* operand, FILE* output, unsigned flags = 0)
 void aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* output,
                      unsigned flags = 0);
 void aco_print_program(const Program* program, FILE* output, unsigned flags = 0);
-void aco_print_program(const Program* program, FILE* output, const live& live_vars,
-                       unsigned flags = 0);
 
-void _aco_perfwarn(Program* program, const char* file, unsigned line, const char* fmt, ...);
 void _aco_err(Program* program, const char* file, unsigned line, const char* fmt, ...);
 
-#define aco_perfwarn(program, ...) _aco_perfwarn(program, __FILE__, __LINE__, __VA_ARGS__)
 #define aco_err(program, ...)      _aco_err(program, __FILE__, __LINE__, __VA_ARGS__)
 
 int get_op_fixed_to_def(Instruction* instr);
@@ -2227,8 +2222,6 @@ int get_op_fixed_to_def(Instruction* instr);
 /* utilities for dealing with register demand */
 RegisterDemand get_live_changes(aco_ptr<Instruction>& instr);
 RegisterDemand get_temp_registers(aco_ptr<Instruction>& instr);
-RegisterDemand get_demand_before(RegisterDemand demand, aco_ptr<Instruction>& instr,
-                                 aco_ptr<Instruction>& instr_before);
 
 /* number of sgprs that need to be allocated but might notbe addressable as s0-s105 */
 uint16_t get_extra_sgprs(Program* program);

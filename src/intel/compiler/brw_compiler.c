@@ -32,6 +32,7 @@
 const struct nir_shader_compiler_options brw_scalar_nir_options = {
    .avoid_ternary_with_two_constants = true,
    .compact_arrays = true,
+   .discard_is_demote = true,
    .divergence_analysis_options =
       (nir_divergence_single_patch_per_tcs_subgroup |
        nir_divergence_single_patch_per_tes_subgroup |
@@ -112,7 +113,8 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
       nir_lower_imul_high64 |
       nir_lower_find_lsb64 |
       nir_lower_ufind_msb64 |
-      nir_lower_bit_count64;
+      nir_lower_bit_count64 |
+      nir_lower_iadd3_64;
    nir_lower_doubles_options fp64_options =
       nir_lower_drcp |
       nir_lower_dsqrt |

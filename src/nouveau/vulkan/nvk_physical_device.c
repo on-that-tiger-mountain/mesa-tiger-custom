@@ -228,6 +228,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_module_identifier = true,
       .EXT_shader_object = true,
+      .EXT_shader_replicated_composites = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
       .EXT_shader_viewport_index_layer = info->cls_eng3d >= MAXWELL_B,
@@ -598,6 +599,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_EXT_shader_object */
       .shaderObject = true,
 
+      /* VK_EXT_shader_replicated_composites */
+      .shaderReplicatedComposites = true,
+
       /* VK_KHR_shader_subgroup_uniform_control_flow */
       .shaderSubgroupUniformControlFlow = nvk_use_nak(info),
 
@@ -620,12 +624,6 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_NV_shader_sm_builtins */
       .shaderSMBuiltins = true,
    };
-}
-
-uint32_t
-nvk_min_cbuf_alignment(const struct nv_device_info *info)
-{
-   return info->cls_eng3d >= TURING_A ? 64 : 256;
 }
 
 static void
@@ -1097,6 +1095,27 @@ nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
    return pdev->info.vram_size_B - used;
 }
 
+static bool
+drm_device_is_nouveau(const char *path)
+{
+   int fd = open(path, O_RDWR | O_CLOEXEC);
+   if (fd < 0)
+      return false;
+
+   drmVersionPtr ver = drmGetVersion(fd);
+   if (!ver) {
+      close(fd);
+      return false;
+   }
+
+   const bool is_nouveau = !strncmp("nouveau", ver->name, ver->name_len);
+
+   drmFreeVersion(ver);
+   close(fd);
+
+   return is_nouveau;
+}
+
 VkResult
 nvk_create_drm_physical_device(struct vk_instance *_instance,
                                drmDevicePtr drm_device,
@@ -1132,6 +1151,9 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    default:
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
+
+   if (!drm_device_is_nouveau(drm_device->nodes[DRM_NODE_RENDER]))
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
 
    struct nouveau_ws_device *ws_dev = nouveau_ws_device_new(drm_device);
    if (!ws_dev)

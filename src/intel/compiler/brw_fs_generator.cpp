@@ -65,8 +65,7 @@ brw_math_function(enum opcode op)
 }
 
 static struct brw_reg
-brw_reg_from_fs_reg(const struct intel_device_info *devinfo, fs_inst *inst,
-                    fs_reg *reg)
+normalize_brw_reg_for_encoding(brw_reg *reg)
 {
    struct brw_reg brw_reg;
 
@@ -75,7 +74,7 @@ brw_reg_from_fs_reg(const struct intel_device_info *devinfo, fs_inst *inst,
    case FIXED_GRF:
    case IMM:
       assert(reg->offset == 0);
-      brw_reg = reg->as_brw_reg();
+      brw_reg = *reg;
       break;
    case BAD_FILE:
       /* Probably unused. */
@@ -358,9 +357,10 @@ fs_generator::generate_shuffle(fs_inst *inst,
     * gets weird because it reads all of the channels regardless of execution
     * size.  It's easier just to split it here.
     */
-   const unsigned lower_width =
-      element_sz(src) > 4 || element_sz(dst) > 4 ? 8 :
-      MIN2(16, inst->exec_size);
+   unsigned lower_width = MIN2(16, inst->exec_size);
+   if (devinfo->ver < 20 && (element_sz(src) > 4 || element_sz(dst) > 4)) {
+      lower_width = 8;
+   }
 
    brw_set_default_exec_size(p, cvt(lower_width) - 1);
    for (unsigned group = 0; group < inst->exec_size; group += lower_width) {
@@ -859,7 +859,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       }
 
       for (unsigned int i = 0; i < inst->sources; i++) {
-         src[i] = brw_reg_from_fs_reg(devinfo, inst, &inst->src[i]);
+         src[i] = normalize_brw_reg_for_encoding(&inst->src[i]);
 	 /* The accumulator result appears to get used for the
 	  * conditional modifier generation.  When negating a UD
 	  * value, there is a 33rd bit generated for the sign in the
@@ -870,7 +870,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 		inst->src[i].type != BRW_TYPE_UD ||
 		!inst->src[i].negate);
       }
-      dst = brw_reg_from_fs_reg(devinfo, inst, &inst->dst);
+      dst = normalize_brw_reg_for_encoding(&inst->dst);
 
       brw_set_default_access_mode(p, BRW_ALIGN_1);
       brw_set_default_predicate_control(p, inst->predicate);
@@ -1329,7 +1329,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          brw_float_controls_mode(p, src[0].d, src[1].d);
          break;
 
-      case SHADER_OPCODE_READ_SR_REG:
+      case SHADER_OPCODE_READ_ARCH_REG:
          if (devinfo->ver >= 12) {
             /* There is a SWSB restriction that requires that any time sr0 is
              * accessed both the instruction doing the access and the next one
@@ -1337,13 +1337,12 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
              */
             if (brw_get_default_swsb(p).mode != TGL_SBID_NULL)
                brw_SYNC(p, TGL_SYNC_NOP);
-            assert(src[0].file == BRW_IMMEDIATE_VALUE);
             brw_set_default_swsb(p, tgl_swsb_regdist(1));
-            brw_MOV(p, dst, brw_sr0_reg(src[0].ud));
+            brw_MOV(p, dst, src[0]);
             brw_set_default_swsb(p, tgl_swsb_regdist(1));
             brw_AND(p, dst, dst, brw_imm_ud(0xffffffff));
          } else {
-            brw_MOV(p, dst, brw_sr0_reg(src[0].ud));
+            brw_MOV(p, dst, src[0]);
          }
          break;
 

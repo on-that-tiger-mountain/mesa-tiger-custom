@@ -135,6 +135,7 @@ static const struct spirv_capabilities implemented_capabilities = {
    .RayTracingKHR = true,
    .RayTracingPositionFetchKHR = true,
    .RayTraversalPrimitiveCullingKHR = true,
+   .ReplicatedCompositesEXT = true,
    .RoundingModeRTE = true,
    .RoundingModeRTZ = true,
    .RuntimeDescriptorArrayEXT = true,
@@ -202,6 +203,8 @@ uint32_t mesa_spirv_debug = 0;
 static const struct debug_named_value mesa_spirv_debug_control[] = {
    { "structured", MESA_SPIRV_DEBUG_STRUCTURED,
      "Print information of the SPIR-V structured control flow parsing" },
+   { "values", MESA_SPIRV_DEBUG_VALUES,
+     "Print information of the SPIR-V values" },
    DEBUG_NAMED_VALUE_END,
 };
 
@@ -352,6 +355,9 @@ _vtn_fail(struct vtn_builder *b, const char *file, unsigned line,
 {
    va_list args;
 
+   if (MESA_SPIRV_DEBUG(VALUES))
+      vtn_dump_values(b, stderr);
+
    va_start(args, fmt);
    vtn_log_err(b, NIR_SPIRV_DEBUG_LEVEL_ERROR, "SPIR-V parsing FAILED:\n",
                file, line, fmt, args);
@@ -391,6 +397,33 @@ vtn_value_type_to_string(enum vtn_value_type t)
    unreachable("unknown value type");
    return "UNKNOWN";
 }
+
+static const char *
+vtn_base_type_to_string(enum vtn_base_type t)
+{
+#define CASE(typ) case vtn_base_type_##typ: return #typ
+   switch (t) {
+   CASE(void);
+   CASE(scalar);
+   CASE(vector);
+   CASE(matrix);
+   CASE(array);
+   CASE(struct);
+   CASE(pointer);
+   CASE(image);
+   CASE(sampler);
+   CASE(sampled_image);
+   CASE(accel_struct);
+   CASE(ray_query);
+   CASE(function);
+   CASE(event);
+   CASE(cooperative_matrix);
+   }
+#undef CASE
+   unreachable("unknown base type");
+   return "UNKNOWN";
+}
+
 
 void
 _vtn_fail_value_type_mismatch(struct vtn_builder *b, uint32_t value_id,
@@ -2306,29 +2339,52 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
    }
 
    case SpvOpSpecConstantComposite:
-   case SpvOpConstantComposite: {
-      unsigned elem_count = count - 3;
-      unsigned expected_length = val->type->base_type == vtn_base_type_cooperative_matrix ?
+   case SpvOpConstantComposite:
+   case SpvOpConstantCompositeReplicateEXT:
+   case SpvOpSpecConstantCompositeReplicateEXT: {
+      const unsigned elem_count =
+         val->type->base_type == vtn_base_type_cooperative_matrix ?
          1 : val->type->length;
-      vtn_fail_if(elem_count != expected_length,
-                  "%s has %u constituents, expected %u",
-                  spirv_op_to_string(opcode), elem_count, expected_length);
 
       nir_constant **elems = ralloc_array(b, nir_constant *, elem_count);
-      val->is_undef_constant = true;
-      for (unsigned i = 0; i < elem_count; i++) {
-         struct vtn_value *elem_val = vtn_untyped_value(b, w[i + 3]);
+      if (opcode == SpvOpConstantCompositeReplicateEXT ||
+          opcode == SpvOpSpecConstantCompositeReplicateEXT) {
+         struct vtn_value *elem_val = vtn_untyped_value(b, w[3]);
 
          if (elem_val->value_type == vtn_value_type_constant) {
-            elems[i] = elem_val->constant;
-            val->is_undef_constant = val->is_undef_constant &&
-                                     elem_val->is_undef_constant;
+            elems[0] = elem_val->constant;
+            val->is_undef_constant = false;
          } else {
             vtn_fail_if(elem_val->value_type != vtn_value_type_undef,
-                        "only constants or undefs allowed for "
-                        "SpvOpConstantComposite");
+                        "only constants or undefs allowed for %s",
+                        spirv_op_to_string(opcode));
             /* to make it easier, just insert a NULL constant for now */
-            elems[i] = vtn_null_constant(b, elem_val->type);
+            elems[0] = vtn_null_constant(b, elem_val->type);
+            val->is_undef_constant = true;
+         }
+
+         for (unsigned i = 1; i < elem_count; i++)
+            elems[i] = elems[0];
+      } else {
+         vtn_fail_if(elem_count != count - 3,
+                     "%s has %u constituents, expected %u",
+                     spirv_op_to_string(opcode), count - 3, elem_count);
+
+         val->is_undef_constant = true;
+         for (unsigned i = 0; i < elem_count; i++) {
+            struct vtn_value *elem_val = vtn_untyped_value(b, w[i + 3]);
+
+            if (elem_val->value_type == vtn_value_type_constant) {
+               elems[i] = elem_val->constant;
+               val->is_undef_constant = val->is_undef_constant &&
+                                        elem_val->is_undef_constant;
+            } else {
+               vtn_fail_if(elem_val->value_type != vtn_value_type_undef,
+                           "only constants or undefs allowed for %s",
+                           spirv_op_to_string(opcode));
+               /* to make it easier, just insert a NULL constant for now */
+               elems[i] = vtn_null_constant(b, elem_val->type);
+            }
          }
       }
 
@@ -2434,31 +2490,38 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
          int elem = -1;
          const struct vtn_type *type = comp->type;
          for (unsigned i = deref_start; i < count; i++) {
-            vtn_fail_if(w[i] > type->length,
-                        "%uth index of %s is %u but the type has only "
-                        "%u elements", i - deref_start,
-                        spirv_op_to_string(opcode), w[i], type->length);
+            if (type->base_type == vtn_base_type_cooperative_matrix) {
+               /* Cooperative matrices are always scalar constants.  We don't
+                * care about the index w[i] because it's always replicated.
+                */
+               type = type->component_type;
+            } else {
+               vtn_fail_if(w[i] > type->length,
+                           "%uth index of %s is %u but the type has only "
+                           "%u elements", i - deref_start,
+                           spirv_op_to_string(opcode), w[i], type->length);
 
-            switch (type->base_type) {
-            case vtn_base_type_vector:
-               elem = w[i];
-               type = type->array_element;
-               break;
+               switch (type->base_type) {
+               case vtn_base_type_vector:
+                  elem = w[i];
+                  type = type->array_element;
+                  break;
 
-            case vtn_base_type_matrix:
-            case vtn_base_type_array:
-               c = &(*c)->elements[w[i]];
-               type = type->array_element;
-               break;
+               case vtn_base_type_matrix:
+               case vtn_base_type_array:
+                  c = &(*c)->elements[w[i]];
+                  type = type->array_element;
+                  break;
 
-            case vtn_base_type_struct:
-               c = &(*c)->elements[w[i]];
-               type = type->members[w[i]];
-               break;
+               case vtn_base_type_struct:
+                  c = &(*c)->elements[w[i]];
+                  type = type->members[w[i]];
+                  break;
 
-            default:
-               vtn_fail("%s must only index into composite types",
-                        spirv_op_to_string(opcode));
+               default:
+                  vtn_fail("%s must only index into composite types",
+                           spirv_op_to_string(opcode));
+               }
             }
          }
 
@@ -4499,7 +4562,8 @@ vtn_handle_composite(struct vtn_builder *b, SpvOp opcode,
                                     w + 5);
       break;
 
-   case SpvOpCompositeConstruct: {
+   case SpvOpCompositeConstruct:
+   case SpvOpCompositeConstructReplicateEXT: {
       unsigned elems = count - 3;
       assume(elems >= 1);
       if (type->base_type == vtn_base_type_cooperative_matrix) {
@@ -4508,18 +4572,35 @@ vtn_handle_composite(struct vtn_builder *b, SpvOp opcode,
          nir_cmat_construct(&b->nb, &mat->def, vtn_get_nir_ssa(b, w[3]));
          vtn_set_ssa_value_var(b, ssa, mat->var);
       } else if (glsl_type_is_vector_or_scalar(type->type)) {
-         nir_def *srcs[NIR_MAX_VEC_COMPONENTS];
-         for (unsigned i = 0; i < elems; i++) {
-            srcs[i] = vtn_get_nir_ssa(b, w[3 + i]);
-            vtn_assert(glsl_get_bit_size(type->type) == srcs[i]->bit_size);
+         if (opcode == SpvOpCompositeConstructReplicateEXT) {
+            nir_def *src = vtn_get_nir_ssa(b, w[3]);
+            vtn_assert(glsl_get_bit_size(type->type) == src->bit_size);
+            unsigned swiz[NIR_MAX_VEC_COMPONENTS] = { 0, };
+            ssa->def = nir_swizzle(&b->nb, src, swiz,
+                                   glsl_get_vector_elements(type->type));
+         } else {
+            nir_def *srcs[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < elems; i++) {
+               srcs[i] = vtn_get_nir_ssa(b, w[3 + i]);
+               vtn_assert(glsl_get_bit_size(type->type) == srcs[i]->bit_size);
+            }
+            ssa->def =
+               vtn_vector_construct(b, glsl_get_vector_elements(type->type),
+                                    elems, srcs);
          }
-         ssa->def =
-            vtn_vector_construct(b, glsl_get_vector_elements(type->type),
-                                 elems, srcs);
       } else {
-         ssa->elems = vtn_alloc_array(b, struct vtn_ssa_value *, elems);
-         for (unsigned i = 0; i < elems; i++)
-            ssa->elems[i] = vtn_ssa_value(b, w[3 + i]);
+         ssa->elems = vtn_alloc_array(b, struct vtn_ssa_value *, type->length);
+         if (opcode == SpvOpCompositeConstructReplicateEXT) {
+            struct vtn_ssa_value *elem = vtn_ssa_value(b, w[3]);
+            for (unsigned i = 0; i < type->length; i++)
+               ssa->elems[i] = elem;
+         } else {
+            vtn_fail_if(elems != type->length,
+                        "%s has %u constituents, expected %u",
+                        spirv_op_to_string(opcode), elems, type->length);
+            for (unsigned i = 0; i < elems; i++)
+               ssa->elems[i] = vtn_ssa_value(b, w[3 + i]);
+         }
       }
       break;
    }
@@ -4628,6 +4709,8 @@ vtn_handle_barrier(struct vtn_builder *b, SpvOp opcode,
                                SpvMemorySemanticsSequentiallyConsistentMask);
          memory_semantics |= SpvMemorySemanticsAcquireReleaseMask |
                              SpvMemorySemanticsOutputMemoryMask;
+         if (memory_scope == SpvScopeSubgroup || memory_scope == SpvScopeInvocation)
+            memory_scope = SpvScopeWorkgroup;
       }
 
       vtn_emit_scoped_control_barrier(b, execution_scope, memory_scope,
@@ -5520,11 +5603,13 @@ vtn_handle_variable_or_type_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpConstantFalse:
    case SpvOpConstant:
    case SpvOpConstantComposite:
+   case SpvOpConstantCompositeReplicateEXT:
    case SpvOpConstantNull:
    case SpvOpSpecConstantTrue:
    case SpvOpSpecConstantFalse:
    case SpvOpSpecConstant:
    case SpvOpSpecConstantComposite:
+   case SpvOpSpecConstantCompositeReplicateEXT:
    case SpvOpSpecConstantOp:
       vtn_handle_constant(b, opcode, w, count);
       break;
@@ -6280,6 +6365,7 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpVectorInsertDynamic:
    case SpvOpVectorShuffle:
    case SpvOpCompositeConstruct:
+   case SpvOpCompositeConstructReplicateEXT:
    case SpvOpCompositeExtract:
    case SpvOpCompositeInsert:
    case SpvOpCopyLogical:
@@ -6766,7 +6852,8 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
     * Related glslang issue: https://github.com/KhronosGroup/glslang/issues/2416
     */
    bool dxsc = b->generator_id == vtn_generator_spiregg;
-   b->convert_discard_to_demote = ((dxsc && !b->enabled_capabilities.DemoteToHelperInvocation) ||
+   b->convert_discard_to_demote = (nir_options->discard_is_demote ||
+                                   (dxsc && !b->enabled_capabilities.DemoteToHelperInvocation) ||
                                    (is_glslang(b) && b->source_lang == SpvSourceLanguageHLSL)) &&
                                   b->supported_capabilities.DemoteToHelperInvocation;
 
@@ -6849,6 +6936,10 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
          entry_point = vtn_emit_kernel_entry_point_wrapper(b, entry_point);
 
       entry_point->is_entrypoint = true;
+   }
+
+   if (MESA_SPIRV_DEBUG(VALUES)) {
+      vtn_dump_values(b, stdout);
    }
 
    /* structurize the CFG */
@@ -7143,4 +7234,83 @@ spirv_library_to_nir_builder(FILE *fp, const uint32_t *words, size_t word_count,
 
    ralloc_free(b);
    return true;
+}
+
+static unsigned
+vtn_id_for_type(struct vtn_builder *b, struct vtn_type *type)
+{
+   for (unsigned i = 0; i < b->value_id_bound; i++) {
+      struct vtn_value *v = &b->values[i];
+      if (v->value_type == vtn_value_type_type &&
+          v->type == type)
+         return i;
+   }
+
+   return 0;
+}
+
+void
+vtn_print_value(struct vtn_builder *b, struct vtn_value *val, FILE *f)
+{
+   fprintf(f, "%s", vtn_value_type_to_string(val->value_type));
+   switch (val->value_type) {
+   case vtn_value_type_ssa: {
+      struct vtn_ssa_value *ssa = val->ssa;
+      fprintf(f,  " glsl_type=%s", glsl_get_type_name(ssa->type));
+      break;
+   }
+
+   case vtn_value_type_constant: {
+      fprintf(f, " type=%d", vtn_id_for_type(b, val->type));
+      if (val->is_null_constant)
+         fprintf(f, " null");
+      else if (val->is_undef_constant)
+         fprintf(f, " undef");
+      break;
+   }
+
+   case vtn_value_type_pointer: {
+      struct vtn_pointer *pointer = val->pointer;
+      fprintf(f, " ptr_type=%u", vtn_id_for_type(b, pointer->ptr_type));
+      fprintf(f, " (pointed-)type=%u", vtn_id_for_type(b, val->pointer->type));
+
+      if (pointer->deref) {
+         fprintf(f, "\n           NIR: ");
+         nir_print_instr(&pointer->deref->instr, f);
+      }
+      break;
+   }
+
+   case vtn_value_type_type: {
+      struct vtn_type *type = val->type;
+      fprintf(f, " %s", vtn_base_type_to_string(type->base_type));
+      switch (type->base_type) {
+      case vtn_base_type_pointer:
+         fprintf(f, " deref=%d", vtn_id_for_type(b, type->deref));
+         fprintf(f, " %s", spirv_storageclass_to_string(val->type->storage_class));
+         break;
+      default:
+         break;
+      }
+      if (type->type)
+         fprintf(f, " glsl_type=%s", glsl_get_type_name(type->type));
+      break;
+   }
+
+   default:
+      break;
+   }
+   fprintf(f, "\n");
+}
+
+void
+vtn_dump_values(struct vtn_builder *b, FILE *f)
+{
+   fprintf(f, "=== SPIR-V values\n");
+   for (unsigned i = 1; i < b->value_id_bound; i++) {
+      struct vtn_value *val = &b->values[i];
+      fprintf(f, "%8d = ", i);
+      vtn_print_value(b, val, f);
+   }
+   fprintf(f, "===\n");
 }

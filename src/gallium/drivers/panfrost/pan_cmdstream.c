@@ -2538,7 +2538,7 @@ emit_fbd(struct panfrost_batch *batch, struct pan_fb_info *fb)
 #endif
 
    batch->framebuffer.gpu |=
-      GENX(pan_emit_fbd)(fb, &tls, &batch->tiler_ctx, batch->framebuffer.cpu);
+      GENX(pan_emit_fbd)(fb, 0, &tls, &batch->tiler_ctx, batch->framebuffer.cpu);
 }
 
 /* Mark a surface as written */
@@ -2986,7 +2986,7 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    /* Emulate indirect draws on JM */
    if (indirect && indirect->buffer) {
       assert(num_draws == 1);
-      util_draw_indirect(pipe, info, indirect);
+      util_draw_indirect(pipe, info, drawid_offset, indirect);
       perf_debug(ctx, "Emulating indirect draw on the CPU");
       return;
    }

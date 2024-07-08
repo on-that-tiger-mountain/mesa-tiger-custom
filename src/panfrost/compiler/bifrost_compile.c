@@ -879,7 +879,7 @@ bi_src_color_vec4(bi_builder *b, nir_src *src, nir_alu_type T)
    for (i = 0; i < num_components; i++)
       src_vals[i] = bi_extract(b, base, i);
 
-   for(; i < 3; i++)
+   for (; i < 3; i++)
       src_vals[i] = (size == 16) ? bi_imm_f16(0.0) : bi_imm_f32(0.0);
    src_vals[3] = (size == 16) ? bi_imm_f16(1.0) : bi_imm_f32(1.0);
    bi_index temp = bi_temp(b->shader);
@@ -952,7 +952,8 @@ bi_emit_fragment_out(bi_builder *b, nir_intrinsic_instr *instr)
       nir_alu_type T = nir_intrinsic_src_type(instr);
       nir_alu_type T2 = dual ? nir_intrinsic_dest_type(instr) : 0;
       bi_index color = bi_src_color_vec4(b, &instr->src[0], T);
-      bi_index color2 = dual ? bi_src_color_vec4(b, &instr->src[4], T2) : bi_null();
+      bi_index color2 =
+         dual ? bi_src_color_vec4(b, &instr->src[4], T2) : bi_null();
 
       if (instr->intrinsic == nir_intrinsic_store_output &&
           loc >= FRAG_RESULT_DATA0 && loc <= FRAG_RESULT_DATA7) {
@@ -1742,11 +1743,11 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       bi_emit_ld_tile(b, instr);
       break;
 
-   case nir_intrinsic_discard_if:
+   case nir_intrinsic_terminate_if:
       bi_discard_b32(b, bi_src_index(&instr->src[0]));
       break;
 
-   case nir_intrinsic_discard:
+   case nir_intrinsic_terminate:
       bi_discard_f32(b, bi_zero(), bi_zero(), BI_CMPF_EQ);
       break;
 
@@ -3576,7 +3577,8 @@ bi_emit_tex_valhall(bi_builder *b, nir_tex_instr *instr)
 
       switch (instr->src[i].src_type) {
       case nir_tex_src_coord: {
-         unsigned components = nir_src_num_components(instr->src[i].src) - instr->is_array;
+         unsigned components =
+            nir_src_num_components(instr->src[i].src) - instr->is_array;
 
          if (instr->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
             sregs[VALHALL_TEX_SREG_X_COORD] = bi_emit_texc_cube_coord(
@@ -3595,8 +3597,7 @@ bi_emit_tex_valhall(bi_builder *b, nir_tex_instr *instr)
          }
 
          if (instr->is_array) {
-            sregs[VALHALL_TEX_SREG_ARRAY] =
-               bi_extract(b, index, components);
+            sregs[VALHALL_TEX_SREG_ARRAY] = bi_extract(b, index, components);
          }
 
          break;
@@ -4454,6 +4455,9 @@ mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    uint32_t align = nir_combined_align(align_mul, align_offset);
    assert(util_is_power_of_two_nonzero(align));
 
+   /* No more than 16 bytes at a time. */
+   bytes = MIN2(bytes, 16);
+
    /* If the number of bytes is a multiple of 4, use 32-bit loads. Else if it's
     * a multiple of 2, use 16-bit loads. Else use 8-bit loads.
     */
@@ -4471,7 +4475,7 @@ mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    unsigned num_comps = bytes / (bit_size / 8);
 
    /* Push constants require 32-bit loads. */
-  if (intrin == nir_intrinsic_load_push_constant) {
+   if (intrin == nir_intrinsic_load_push_constant) {
       if (align_mul >= 4) {
          /* If align_mul is bigger than 4 we can use align_offset to find
           * the exact number of words we need to read.
@@ -4567,7 +4571,7 @@ bi_optimize_nir(nir_shader *nir, unsigned gpu_id, bool is_blend)
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS_V(nir, nir_shader_intrinsics_pass,
                  bifrost_nir_lower_blend_components,
-                 nir_metadata_block_index | nir_metadata_dominance, NULL);
+                 nir_metadata_control_flow, NULL);
    }
 
    /* Backend scheduler is purely local, so do some global optimizations
@@ -4786,7 +4790,7 @@ bifrost_nir_lower_load_output(nir_shader *nir)
 
    return nir_shader_intrinsics_pass(
       nir, bi_lower_load_output,
-      nir_metadata_block_index | nir_metadata_dominance, NULL);
+      nir_metadata_control_flow, NULL);
 }
 
 static bool
@@ -4810,8 +4814,6 @@ bi_lower_load_push_const_with_dyn_offset(nir_builder *b,
    uint32_t base = nir_intrinsic_base(intr);
    uint32_t range = nir_intrinsic_range(intr);
    uint32_t nwords = intr->def.num_components;
-   uint32_t first_word = base / 4;
-   uint32_t last_word = (base + range) / 4;
 
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -4821,12 +4823,12 @@ bi_lower_load_push_const_with_dyn_offset(nir_builder *b,
     */
    nir_def *lut[64] = {0};
 
-   assert(last_word <= ARRAY_SIZE(lut));
+   assert(range / 4 <= ARRAY_SIZE(lut));
 
    /* Load all words in the range. */
-   for (uint32_t w = first_word; w < last_word; w++) {
+   for (uint32_t w = 0; w < range / 4; w++) {
       lut[w] = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0),
-                                      .base = w * 4, .range = 4);
+                                      .base = base + (w * 4), .range = 4);
    }
 
    nir_def *index = intr->src[0].ssa;
@@ -4839,10 +4841,10 @@ bi_lower_load_push_const_with_dyn_offset(nir_builder *b,
       uint32_t stride = lut_sz / 2;
       nir_def *bit_test = NULL;
 
-      /* Stop when the first and last component don't fit in the new LUT
-       * window.
+      /* Stop when the LUT is smaller than the number of words we're trying to
+       * extract.
        */
-      if (((first_word + nwords - 1) & stride) != (first_word & stride))
+      if (lut_sz <= nwords)
          break;
 
       for (uint32_t i = 0; i < stride; i++) {
@@ -4862,14 +4864,9 @@ bi_lower_load_push_const_with_dyn_offset(nir_builder *b,
             lut[i] = lut[i + stride];
          }
       }
-
-      /* Adjust first_word so it always points to the bottom half of our LUT,
-       * which contains the result of the CSELs we've just done.
-       */
-      first_word &= stride - 1;
    }
 
-   nir_def *res = nir_vec(b, &lut[first_word], nwords);
+   nir_def *res = nir_vec(b, &lut[0], nwords);
 
    nir_def_rewrite_uses(&intr->def, res);
    nir_instr_remove(&intr->instr);
@@ -4933,7 +4930,7 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
                  ~bi_fp32_varying_mask(nir), false);
 
       NIR_PASS_V(nir, nir_shader_intrinsics_pass, bi_lower_sample_mask_writes,
-                 nir_metadata_block_index | nir_metadata_dominance, NULL);
+                 nir_metadata_control_flow, NULL);
 
       NIR_PASS_V(nir, bifrost_nir_lower_load_output);
    } else if (nir->info.stage == MESA_SHADER_VERTEX) {
@@ -4956,7 +4953,7 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
 
    NIR_PASS_V(nir, nir_shader_intrinsics_pass,
               bi_lower_load_push_const_with_dyn_offset,
-              nir_metadata_block_index | nir_metadata_dominance, NULL);
+              nir_metadata_control_flow, NULL);
 
    NIR_PASS_V(nir, nir_lower_ssbo);
    NIR_PASS_V(nir, pan_lower_sample_pos);
@@ -5018,7 +5015,7 @@ bi_compile_variant_nir(nir_shader *nir,
          ctx->nir = nir = nir_shader_clone(ctx, nir);
 
       NIR_PASS_V(nir, nir_shader_instructions_pass, bifrost_nir_specialize_idvs,
-                 nir_metadata_block_index | nir_metadata_dominance, &idvs);
+                 nir_metadata_control_flow, &idvs);
 
       /* After specializing, clean up the mess */
       bool progress = true;

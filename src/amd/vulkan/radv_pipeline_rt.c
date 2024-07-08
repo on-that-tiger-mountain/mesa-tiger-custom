@@ -361,7 +361,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
    nir_shader_gather_info(stage->nir, nir_shader_get_entrypoint(stage->nir));
    radv_nir_shader_info_init(stage->stage, MESA_SHADER_NONE, &stage->info);
    radv_nir_shader_info_pass(device, stage->nir, &stage->layout, &stage->key, NULL, RADV_PIPELINE_RAY_TRACING, false,
-                             &stage->info);
+                             false, &stage->info);
 
    /* Declare shader arguments. */
    radv_declare_shader_args(device, NULL, &stage->info, stage->stage, MESA_SHADER_NONE, &stage->args);
@@ -385,7 +385,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
          .address_format = nir_address_format_32bit_offset,
          .stack_alignment = 16,
          .localized_loads = true,
-         .vectorizer_callback = radv_mem_vectorize_callback,
+         .vectorizer_callback = ac_nir_mem_vectorize_callback,
          .vectorizer_data = &pdev->info.gfx_level,
       };
       nir_lower_shader_calls(stage->nir, &opts, &resume_shaders, &num_resume_shaders, stage->nir);
@@ -666,8 +666,10 @@ radv_rt_compile_shaders(struct radv_device *device, struct vk_pipeline_cache *ca
     * shaders.
     */
    bool traversal_needed = !library && (!monolithic || raygen_imported);
-   if (!traversal_needed)
-      return VK_SUCCESS;
+   if (!traversal_needed) {
+      result = VK_SUCCESS;
+      goto cleanup;
+   }
 
    struct radv_ray_tracing_stage_info traversal_info = {
       .set_flags = 0xFFFFFFFF,

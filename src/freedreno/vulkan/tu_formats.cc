@@ -634,6 +634,14 @@ tu_get_image_format_properties(
       }
    }
 
+   if (image_usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+      if (!(format_feature_flags &
+            (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+             VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))) {
+         return tu_image_unsupported_format(pImageFormatProperties);
+      }
+   }
+
    *pImageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = maxExtent,
       .maxMipLevels = maxMipLevels,
@@ -689,12 +697,14 @@ tu_get_external_image_format_properties(
                           handleType, pImageFormatInfo->type);
       }
       break;
+#if DETECT_OS_ANDROID
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
       flags = VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
               VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
               VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
       compat_flags = export_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
       break;
+#endif
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
       flags = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
       compat_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -869,37 +879,4 @@ tu_GetPhysicalDeviceSparseImageFormatProperties2(
 {
    /* Sparse images are not yet supported. */
    *pPropertyCount = 0;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-tu_GetPhysicalDeviceExternalBufferProperties(
-   VkPhysicalDevice physicalDevice,
-   const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
-   VkExternalBufferProperties *pExternalBufferProperties)
-{
-   BITMASK_ENUM(VkExternalMemoryFeatureFlagBits) flags = 0;
-   VkExternalMemoryHandleTypeFlags export_flags = 0;
-   VkExternalMemoryHandleTypeFlags compat_flags = 0;
-   switch (pExternalBufferInfo->handleType) {
-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
-      flags = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
-              VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
-      compat_flags = export_flags =
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      break;
-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
-      flags = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
-      compat_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-      break;
-   default:
-      break;
-   }
-   pExternalBufferProperties->externalMemoryProperties =
-      (VkExternalMemoryProperties) {
-         .externalMemoryFeatures = flags,
-         .exportFromImportedHandleTypes = export_flags,
-         .compatibleHandleTypes = compat_flags,
-      };
 }

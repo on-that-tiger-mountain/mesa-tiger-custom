@@ -462,8 +462,7 @@ GENX(csf_preload_fb)(struct panfrost_batch *batch, struct pan_fb_info *fb)
    struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
 
    GENX(pan_preload_fb)
-   (&dev->blitter, &batch->pool.base, NULL, fb, batch->tls.gpu,
-    batch->tiler_ctx.bifrost, NULL);
+   (&dev->blitter, &batch->pool.base, fb, 0, batch->tls.gpu, NULL);
 }
 
 void
@@ -671,6 +670,9 @@ GENX(csf_launch_xfb)(struct panfrost_batch *batch,
 
    csf_emit_shader_regs(batch, PIPE_SHADER_VERTEX,
                         batch->rsd[PIPE_SHADER_VERTEX]);
+   /* force a barrier to avoid read/write sync issues with buffers */
+   cs_wait_slot(b, 2, false);
+
    /* XXX: Choose correctly */
    cs_run_compute(b, 1, MALI_TASK_AXIS_Z, false, cs_shader_res_sel(0, 0, 0, 0));
 }

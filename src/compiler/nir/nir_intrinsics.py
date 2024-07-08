@@ -324,6 +324,11 @@ index("unsigned", "repeat_count")
 
 intrinsic("nop", flags=[CAN_ELIMINATE])
 
+# Uses a value and cannot be eliminated.
+#
+# This is helpful when writing unit tests
+intrinsic("use", src_comp=[0], flags=[])
+
 intrinsic("convert_alu_types", dest_comp=0, src_comp=[0],
           indices=[SRC_TYPE, DEST_TYPE, ROUNDING_MODE, SATURATE],
           flags=[CAN_ELIMINATE, CAN_REORDER])
@@ -414,8 +419,6 @@ intrinsic("is_sparse_resident_zink", dest_comp=1, src_comp=[0], bit_sizes=[1],
 def barrier(name):
     intrinsic(name)
 
-barrier("discard")
-
 # Demote fragment shader invocation to a helper invocation.  Any stores to
 # memory after this instruction are suppressed and the fragment does not write
 # outputs to the framebuffer.  Unlike discard, demote needs to ensure that
@@ -480,8 +483,7 @@ intrinsic("inverse_ballot", src_comp=[0], dest_comp=1, flags=[CAN_ELIMINATE])
 barrier("begin_invocation_interlock")
 barrier("end_invocation_interlock")
 
-# A conditional discard/demote/terminate, with a single boolean source.
-intrinsic("discard_if", src_comp=[1])
+# A conditional demote/terminate, with a single boolean source.
 intrinsic("demote_if", src_comp=[1])
 intrinsic("terminate_if", src_comp=[1])
 
@@ -1286,9 +1288,9 @@ intrinsic("cmat_copy", src_comp=[-1, -1])
 # The float versions are not handled because those are not supported
 # by the backend.
 store("ssbo_ir3", [1, 1, 1],
-      indices=[WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
+      indices=[BASE, WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 load("ssbo_ir3",  [1, 1, 1],
-     indices=[ACCESS, ALIGN_MUL, ALIGN_OFFSET], flags=[CAN_ELIMINATE])
+     indices=[BASE, ACCESS, ALIGN_MUL, ALIGN_OFFSET], flags=[CAN_ELIMINATE])
 intrinsic("ssbo_atomic_ir3",       src_comp=[1, 1, 1, 1],    dest_comp=1,
           indices=[ACCESS, ATOMIC_OP])
 intrinsic("ssbo_atomic_swap_ir3",  src_comp=[1, 1, 1, 1, 1], dest_comp=1,
@@ -1340,6 +1342,13 @@ store("global_ir3", [2, 1], indices=[ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 # the alignment applies to the base address
 load("global_ir3", [2, 1], indices=[ACCESS, ALIGN_MUL, ALIGN_OFFSET, RANGE_BASE, RANGE], flags=[CAN_ELIMINATE])
 
+# Etnaviv-specific load/glboal intrinsics. They take a 32-bit base address and
+# a 32-bit offset, which doesn't need to be an immediate.
+# src[] = { value, address, 32-bit offset }.
+store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
+# src[] = { address, 32-bit offset }.
+load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+
 # IR3-specific bindless handle specifier. Similar to vulkan_resource_index, but
 # without the binding because the hardware expects a single flattened index
 # rather than a (binding, index) pair. We may also want to use this with GL.
@@ -1362,6 +1371,10 @@ intrinsic("bindless_resource_ir3", [1], dest_comp=1, indices=[DESC_SET], flags=[
 intrinsic("preamble_start_ir3", [], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 
 barrier("preamble_end_ir3")
+
+# IR3-specific intrinsic to choose any invocation. This is implemented the same
+# as elect, except that it doesn't require helper invocations. Used by preambles.
+intrinsic("elect_any_ir3", dest_comp=1, flags=[CAN_ELIMINATE])
 
 # IR3-specific intrinsic for stc. Should be used in the shader preamble.
 store("uniform_ir3", [], indices=[BASE])
@@ -1616,9 +1629,6 @@ system_value("intersection_opaque_amd", 1, bit_sizes=[1])
 # pointer to the next resume shader
 system_value("resume_shader_address_amd", 1, bit_sizes=[64], indices=[CALL_IDX])
 
-# Scratch base of callable stack for ray tracing.
-system_value("rt_dynamic_callable_stack_base_amd", 1)
-
 # Ray Tracing Traversal inputs
 system_value("sbt_offset_amd", 1)
 system_value("sbt_stride_amd", 1)
@@ -1654,6 +1664,10 @@ store("scalar_arg_amd", [], [BASE])
 store("vector_arg_amd", [], [BASE])
 
 # src[] = { 32/64-bit base address, 32-bit offset }.
+#
+# Similar to load_global_constant, the memory accessed must be read-only. This
+# restriction justifies the CAN_REORDER flag. Additionally, the base/offset must
+# be subgroup uniform.
 intrinsic("load_smem_amd", src_comp=[1, 1], dest_comp=0, bit_sizes=[32],
                            indices=[ALIGN_MUL, ALIGN_OFFSET],
                            flags=[CAN_ELIMINATE, CAN_REORDER])
@@ -2020,9 +2034,6 @@ barrier("fence_helper_exit_agx")
 # Pointer to the buffer passing outputs VS->TCS, VS->GS, or TES->GS linkage.
 system_value("vs_output_buffer_agx", 1, bit_sizes=[64])
 
-# Indirect for the above, used for indirect draws.
-system_value("vs_output_buffer_ptr_agx", 1, bit_sizes=[64])
-
 # Mask of VS->TCS, VS->GS, or TES->GS outputs. This is modelled as a sysval
 # directly so it can be dynamic with shader objects or constant folded with
 # pipelines (including GPL)
@@ -2215,11 +2226,27 @@ system_value("ray_query_global_intel", 1, bit_sizes=[64])
 # The accumulator is source 0 because that is the source the intrinsic
 # infrastructure in NIR uses to determine the number of components in the
 # result.
-intrinsic("dpas_intel", dest_comp=0, src_comp=[0, 0, 0],
+#
+# The number of components for the second source is -1 to avoid validation of
+# its value. Some supported configurations will have the component count of
+# that matrix different than the others.
+intrinsic("dpas_intel", dest_comp=0, src_comp=[0, -1, 0],
           indices=[DEST_TYPE, SRC_TYPE, SATURATE, SYSTOLIC_DEPTH, REPEAT_COUNT],
           flags=[CAN_ELIMINATE])
 
 # NVIDIA-specific intrinsics
+# src[] = { index, offset }.
+intrinsic("ldc_nv", dest_comp=0, src_comp=[1, 1],
+          indices=[ACCESS, ALIGN_MUL, ALIGN_OFFSET],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+# [Un]pins an LDCX handle around non-uniform control-flow sections
+# src[] = { handle }.
+intrinsic("pin_cx_handle_nv", src_comp=[1])
+intrinsic("unpin_cx_handle_nv", src_comp=[1])
+# src[] = { handle, offset }.
+intrinsic("ldcx_nv", dest_comp=0, src_comp=[1, 1],
+          indices=[ACCESS, ALIGN_MUL, ALIGN_OFFSET],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
 intrinsic("load_sysval_nv", dest_comp=1, src_comp=[], bit_sizes=[32, 64],
           indices=[ACCESS, BASE], flags=[CAN_ELIMINATE])
 intrinsic("isberd_nv", dest_comp=1, src_comp=[1], bit_sizes=[32],

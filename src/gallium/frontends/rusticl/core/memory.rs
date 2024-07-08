@@ -369,7 +369,7 @@ fn sw_copy(
     for z in 0..region[2] {
         for y in 0..region[1] {
             unsafe {
-                ptr::copy_nonoverlapping(
+                ptr::copy(
                     src.add(
                         (*src_origin + [0, y, z])
                             * [pixel_size as usize, src_row_pitch, src_slice_pitch],
@@ -928,7 +928,7 @@ impl Buffer {
         let tx = self.tx(q, ctx, offset, size, RWFlags::RD)?;
 
         unsafe {
-            ptr::copy_nonoverlapping(tx.ptr(), ptr, size);
+            ptr::copy(tx.ptr(), ptr, size);
         }
 
         Ok(())
@@ -1309,11 +1309,8 @@ impl Image {
         // make sure we allocate multiples of 4 bytes so drivers don't read out of bounds or
         // unaligned.
         // TODO: use div_ceil once it's available
-        let pixel_size = align(
-            self.image_format.pixel_size().unwrap().into(),
-            size_of::<u32>(),
-        );
-        let mut new_pattern: Vec<u32> = vec![0; pixel_size / size_of::<u32>()];
+        let pixel_size = self.image_format.pixel_size().unwrap().into();
+        let mut new_pattern: Vec<u32> = vec![0; div_round_up(pixel_size, size_of::<u32>())];
 
         // we don't support CL_DEPTH for now
         assert!(pattern.len() == 4);

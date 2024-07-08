@@ -56,11 +56,10 @@ radv_get_compute_resource_limits(const struct radv_physical_device *pdev, const 
 }
 
 void
-radv_get_compute_pipeline_metadata(const struct radv_device *device, const struct radv_compute_pipeline *pipeline,
-                                   struct radv_compute_pipeline_metadata *metadata)
+radv_get_compute_shader_metadata(const struct radv_device *device, const struct radv_shader *cs,
+                                 struct radv_compute_pipeline_metadata *metadata)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   const struct radv_shader *cs = pipeline->base.shaders[MESA_SHADER_COMPUTE];
    uint32_t upload_sgpr = 0, inline_sgpr = 0;
 
    memset(metadata, 0, sizeof(*metadata));
@@ -75,23 +74,15 @@ radv_get_compute_pipeline_metadata(const struct radv_device *device, const struc
    metadata->block_size_z = cs->info.cs.block_size[2];
    metadata->wave32 = cs->info.wave_size == 32;
 
-   const struct radv_userdata_info *grid_size_loc = radv_get_user_sgpr(cs, AC_UD_CS_GRID_SIZE);
-   if (grid_size_loc->sgpr_idx != -1) {
-      metadata->grid_base_sgpr = (cs->info.user_data_0 + 4 * grid_size_loc->sgpr_idx - SI_SH_REG_OFFSET) >> 2;
-   }
+   metadata->grid_base_sgpr = radv_get_user_sgpr(cs, AC_UD_CS_GRID_SIZE);
 
-   const struct radv_userdata_info *push_constant_loc = radv_get_user_sgpr(cs, AC_UD_PUSH_CONSTANTS);
-   if (push_constant_loc->sgpr_idx != -1) {
-      upload_sgpr = (cs->info.user_data_0 + 4 * push_constant_loc->sgpr_idx - SI_SH_REG_OFFSET) >> 2;
-   }
-
-   const struct radv_userdata_info *inline_push_constant_loc = radv_get_user_sgpr(cs, AC_UD_INLINE_PUSH_CONSTANTS);
-   if (inline_push_constant_loc->sgpr_idx != -1) {
-      inline_sgpr = (cs->info.user_data_0 + 4 * inline_push_constant_loc->sgpr_idx - SI_SH_REG_OFFSET) >> 2;
-   }
+   upload_sgpr = radv_get_user_sgpr(cs, AC_UD_PUSH_CONSTANTS);
+   inline_sgpr = radv_get_user_sgpr(cs, AC_UD_INLINE_PUSH_CONSTANTS);
 
    metadata->push_const_sgpr = upload_sgpr | (inline_sgpr << 16);
    metadata->inline_push_const_mask = cs->info.inline_push_constant_mask;
+
+   metadata->indirect_desc_sets_sgpr = radv_get_user_sgpr(cs, AC_UD_INDIRECT_DESCRIPTOR_SETS);
 }
 
 void
@@ -106,7 +97,7 @@ radv_compute_pipeline_init(struct radv_compute_pipeline *pipeline, const struct 
 
 struct radv_shader *
 radv_compile_cs(struct radv_device *device, struct vk_pipeline_cache *cache, struct radv_shader_stage *cs_stage,
-                bool keep_executable_info, bool keep_statistic_info, bool is_internal,
+                bool keep_executable_info, bool keep_statistic_info, bool is_internal, bool is_indirect_bindable,
                 struct radv_shader_binary **cs_binary)
 {
    struct radv_shader *cs_shader;
@@ -122,7 +113,7 @@ radv_compile_cs(struct radv_device *device, struct vk_pipeline_cache *cache, str
    /* Run the shader info pass. */
    radv_nir_shader_info_init(cs_stage->stage, MESA_SHADER_NONE, &cs_stage->info);
    radv_nir_shader_info_pass(device, cs_stage->nir, &cs_stage->layout, &cs_stage->key, NULL, RADV_PIPELINE_COMPUTE,
-                             false, &cs_stage->info);
+                             false, is_indirect_bindable, &cs_stage->info);
 
    radv_declare_shader_args(device, NULL, &cs_stage->info, MESA_SHADER_COMPUTE, MESA_SHADER_NONE, &cs_stage->args);
 
@@ -218,11 +209,13 @@ radv_compute_pipeline_compile(const VkComputePipelineCreateInfo *pCreateInfo, st
 
    const struct radv_shader_stage_key stage_key =
       radv_pipeline_get_shader_key(device, &pCreateInfo->stage, pipeline->base.create_flags, pCreateInfo->pNext);
+   const bool is_indirect_bindable = !!(pipeline->base.create_flags & VK_PIPELINE_CREATE_INDIRECT_BINDABLE_BIT_NV);
 
    radv_pipeline_stage_init(pStage, pipeline_layout, &stage_key, &cs_stage);
 
-   pipeline->base.shaders[MESA_SHADER_COMPUTE] = radv_compile_cs(
-      device, cache, &cs_stage, keep_executable_info, keep_statistic_info, pipeline->base.is_internal, &cs_binary);
+   pipeline->base.shaders[MESA_SHADER_COMPUTE] =
+      radv_compile_cs(device, cache, &cs_stage, keep_executable_info, keep_statistic_info, pipeline->base.is_internal,
+                      is_indirect_bindable, &cs_binary);
 
    cs_stage.feedback.duration += os_time_get_nano() - stage_start;
 

@@ -1246,17 +1246,16 @@ x11_wait_for_explicit_sync_release_submission(struct x11_swapchain *chain,
    STACK_ARRAY(struct wsi_image*, images, chain->base.image_count);
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       images[i] = &chain->images[i].base;
-   VkResult result;   
-   #ifdef HAVE_LIBDRM	
-   result =
-      wsi_drm_wait_for_explicit_sync_release(&chain->base,
-                                             chain->base.image_count,
-                                             images,
-                                             rel_timeout_ns,
-                                             image_index);
-   #else
+   VkResult result;
+#ifdef HAVE_LIBDRM
+   result = wsi_drm_wait_for_explicit_sync_release(&chain->base,
+                                                   chain->base.image_count,
+                                                   images,
+                                                   rel_timeout_ns,
+                                                  image_index);
+#else
    result = VK_ERROR_FEATURE_NOT_PRESENT;
-   #endif                                            
+#endif
    STACK_ARRAY_FINISH(images);
    return result;
 }
