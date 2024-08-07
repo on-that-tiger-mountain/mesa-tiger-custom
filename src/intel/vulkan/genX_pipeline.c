@@ -1223,8 +1223,7 @@ get_scratch_surf(struct anv_pipeline *pipeline,
       anv_scratch_pool_alloc(pipeline->device, pool,
                              stage, bin->prog_data->total_scratch);
    anv_reloc_list_add_bo(pipeline->batch.relocs, bo);
-   return anv_scratch_pool_get_surf(pipeline->device,
-                                    &pipeline->device->scratch_pool,
+   return anv_scratch_pool_get_surf(pipeline->device, pool,
                                     bin->prog_data->total_scratch) >> ANV_SCRATCH_SPACE_SHIFT(GFX_VER);
 }
 
@@ -1643,26 +1642,6 @@ emit_3dstate_wm(struct anv_graphics_pipeline *pipeline,
          } else {
             wm.EarlyDepthStencilControl         = EDSC_NORMAL;
          }
-
-         /* Gen8 hardware tries to compute ThreadDispatchEnable for us but
-          * doesn't take into account KillPixels when no depth or stencil
-          * writes are enabled. In order for occlusion queries to work
-          * correctly with no attachments, we need to force-enable PS thread
-          * dispatch.
-          *
-          * The BDW docs are pretty clear that that this bit isn't validated
-          * and probably shouldn't be used in production:
-          *
-          *    "This must always be set to Normal. This field should not be
-          *     tested for functional validation."
-          *
-          * Unfortunately, however, the other mechanism we have for doing this
-          * is 3DSTATE_PS_EXTRA::PixelShaderHasUAV which causes hangs on BDW.
-          * Given two bad options, we choose the one which works.
-          */
-         pipeline->force_fragment_thread_dispatch =
-            wm_prog_data->has_side_effects ||
-            wm_prog_data->uses_kill;
       }
    }
 }
@@ -1705,8 +1684,10 @@ emit_3dstate_ps(struct anv_graphics_pipeline *pipeline,
       ps.SamplerCount               = GFX_VER == 11 ? 0 : get_sampler_count(fs_bin);
       ps.BindingTableEntryCount     = fs_bin->bind_map.surface_count;
 #if GFX_VER < 20
-      ps.PushConstantEnable         = wm_prog_data->base.nr_params > 0 ||
-                                      wm_prog_data->base.ubo_ranges[0].length;
+      ps.PushConstantEnable         =
+         devinfo->needs_null_push_constant_tbimr_workaround ||
+         wm_prog_data->base.nr_params > 0 ||
+         wm_prog_data->base.ubo_ranges[0].length;
 #endif
 
       ps.MaximumNumberofThreadsPerPSD = devinfo->max_threads_per_psd - 1;
@@ -2219,12 +2200,11 @@ genX(compute_pipeline_emit)(struct anv_compute_pipeline *pipeline)
       vfe.URBEntryAllocationSize = 2;
       vfe.CURBEAllocationSize    = vfe_curbe_allocation;
 
-      if (cs_bin->prog_data->total_scratch) {
+      if (cs_prog_data->base.total_scratch) {
          /* Broadwell's Per Thread Scratch Space is in the range [0, 11]
           * where 0 = 1k, 1 = 2k, 2 = 4k, ..., 11 = 2M.
           */
-         vfe.PerThreadScratchSpace =
-            ffs(cs_bin->prog_data->total_scratch) - 11;
+         vfe.PerThreadScratchSpace = ffs(cs_prog_data->base.total_scratch) - 11;
          vfe.ScratchSpaceBasePointer =
             get_scratch_address(&pipeline->base, MESA_SHADER_COMPUTE, cs_bin);
       }

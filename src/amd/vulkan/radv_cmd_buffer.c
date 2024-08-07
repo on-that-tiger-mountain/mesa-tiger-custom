@@ -161,7 +161,7 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
 
    if (memcmp(&dest->vk.cal.color_map, &src->vk.cal.color_map, sizeof(src->vk.cal.color_map))) {
       typed_memcpy(dest->vk.cal.color_map, src->vk.cal.color_map, MAX_RTS);
-      cmd_buffer->state.dirty |= RADV_DYNAMIC_COLOR_ATTACHMENT_MAP;
+      dest_mask |= RADV_DYNAMIC_COLOR_ATTACHMENT_MAP;
    }
 
 #define RADV_CMP_COPY(field, flag)                                                                                     \
@@ -2548,9 +2548,7 @@ input_mask_to_ps_inputs(const struct radv_vs_output_info *outinfo, const struct 
 
       enum radv_ps_in_type type = default_type;
 
-      if (ps->info.ps.flat_shaded_mask & BITFIELD_BIT(*ps_offset))
-         type = radv_ps_in_flat;
-      else if (ps->info.ps.explicit_shaded_mask & BITFIELD_BIT(*ps_offset))
+      if (ps->info.ps.explicit_shaded_mask & BITFIELD_BIT(*ps_offset))
          type = radv_ps_in_explicit;
       else if (ps->info.ps.explicit_strict_shaded_mask & BITFIELD_BIT(*ps_offset))
          type = radv_ps_in_explicit_strict;
@@ -2558,6 +2556,8 @@ input_mask_to_ps_inputs(const struct radv_vs_output_info *outinfo, const struct 
          type = radv_ps_in_interpolated_fp16_hi;
       else if (ps->info.ps.float16_shaded_mask & BITFIELD_BIT(*ps_offset))
          type = radv_ps_in_interpolated_fp16;
+      else if (ps->info.ps.float32_shaded_mask & BITFIELD_BIT(*ps_offset))
+         type = radv_ps_in_interpolated;
 
       ps_input_cntl[*ps_offset] = offset_to_ps_input(vs_offset, type);
       ++(*ps_offset);
@@ -2599,7 +2599,7 @@ radv_emit_ps_inputs(struct radv_cmd_buffer *cmd_buffer)
    if (ps->info.ps.input_clips_culls_mask & 0xf0)
       slot_to_ps_input(outinfo, VARYING_SLOT_CLIP_DIST1, ps_input_cntl, &ps_offset, false, radv_ps_in_interpolated);
 
-   input_mask_to_ps_inputs(outinfo, ps, ps->info.ps.input_mask, ps_input_cntl, &ps_offset, radv_ps_in_interpolated);
+   input_mask_to_ps_inputs(outinfo, ps, ps->info.ps.input_mask, ps_input_cntl, &ps_offset, radv_ps_in_flat);
 
    /* Per-primitive PS inputs: the HW needs these to be last. */
    if (mesh) {
@@ -4263,7 +4263,7 @@ radv_emit_null_ds_state(struct radv_cmd_buffer *cmd_buffer)
       radeon_emit(cmd_buffer->cs, S_028044_FORMAT(V_028044_STENCIL_INVALID));
       uint32_t db_render_control = 0;
 
-      if (gfx_level == GFX11)
+      if (gfx_level == GFX11 || gfx_level == GFX11_5)
          radv_gfx11_set_db_render_control(device, 1, &db_render_control);
 
       radeon_set_context_reg(cmd_buffer->cs, R_028000_DB_RENDER_CONTROL, db_render_control);
@@ -9161,7 +9161,7 @@ radv_CmdSetRenderingAttachmentLocationsKHR(VkCommandBuffer commandBuffer,
                                               : pLocationInfo->pColorAttachmentLocations[i];
    }
 
-   state->dirty |= RADV_DYNAMIC_COLOR_ATTACHMENT_MAP;
+   state->dirty_dynamic |= RADV_DYNAMIC_COLOR_ATTACHMENT_MAP;
 }
 
 VKAPI_ATTR void VKAPI_CALL

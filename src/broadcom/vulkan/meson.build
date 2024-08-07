@@ -54,12 +54,7 @@ files_per_version = files(
 
 v3d_versions = ['42', '71']
 
-v3dv_flags = []
-
-dep_v3d_hw = dependency('v3d_hw', required : false)
-if dep_v3d_hw.found()
-  v3dv_flags += '-DUSE_V3D_SIMULATOR'
-endif
+v3dv_flags = [v3d_simulator_arg]
 
 v3dv_deps = [
   dep_dl,
@@ -71,6 +66,7 @@ v3dv_deps = [
   idep_vulkan_util,
   idep_vulkan_runtime,
   idep_vulkan_wsi,
+  idep_mesautil,
 ]
 
 if with_platform_x11
@@ -141,7 +137,7 @@ broadcom_icd = custom_target(
   output : 'broadcom_icd.@0@.json'.format(host_machine.cpu()),
   command : [
     prog_python, '@INPUT0@',
-    '--api-version', '1.2', '--xml', '@INPUT1@',
+    '--api-version', '1.3', '--xml', '@INPUT1@',
     '--lib-path', join_paths(get_option('prefix'), get_option('libdir'),
     		  	     'libvulkan_broadcom.so'),
     '--out', '@OUTPUT@',

@@ -8,7 +8,10 @@ rnn_src_path = dir_source_root + '/src/freedreno/registers'
 rnn_install_path = get_option('datadir') + '/freedreno/registers'
 rnn_path = rnn_src_path + ':' + get_option('prefix') + '/' + rnn_install_path
 
-dep_lua = dependency('lua54', 'lua53', 'lua52', 'lua', required: false,
+dep_lua = dependency('lua54', 'lua5.4', 'lua-5.4',
+                     'lua53', 'lua5.3', 'lua-5.3',
+                     'lua52', 'lua5.2', 'lua-5.2',
+                     'lua', required: false,
                      allow_fallback: true, version: '>=5.2')
 
 dep_libarchive = dependency('libarchive', allow_fallback: true, required: false)
@@ -35,7 +38,7 @@ if system_has_kms_drm
   subdir('computerator')
 endif
 
-if with_perfetto and (with_datasources.contains('freedreno') or with_datasources.contains('auto'))
+if system_has_kms_drm and with_perfetto and (with_datasources.contains('freedreno') or with_datasources.contains('auto'))
   subdir('ds')
 endif
 

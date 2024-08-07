@@ -40,10 +40,8 @@ if with_gallium_zink and not with_platform_android
   endif
   files_libdri += files('kopper.c')
   deps_for_libdri += vulkan_wsi_deps
-endif
-
-if with_gallium_softpipe
-  libdri_c_args += '-DGALLIUM_SOFTPIPE'
+else
+  files_libdri += files('kopper_stubs.c')
 endif
 
 libdri = static_library(
@@ -60,6 +58,7 @@ libdri = static_library(
     idep_mesautil,
     deps_for_libdri,
   ],
+  link_with : [libloader],
 )
 
 if with_dri

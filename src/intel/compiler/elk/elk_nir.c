@@ -168,6 +168,7 @@ static bool
 is_input(nir_intrinsic_instr *intrin)
 {
    return intrin->intrinsic == nir_intrinsic_load_input ||
+          intrin->intrinsic == nir_intrinsic_load_per_primitive_input ||
           intrin->intrinsic == nir_intrinsic_load_per_vertex_input ||
           intrin->intrinsic == nir_intrinsic_load_interpolated_input;
 }
@@ -1471,7 +1472,7 @@ elk_postprocess_nir(nir_shader *nir, const struct elk_compiler *compiler,
     */
    bool opt_uniform_atomic_stage_allowed = devinfo->ver >= 8;
 
-   if (opt_uniform_atomic_stage_allowed && OPT(nir_opt_uniform_atomics)) {
+   if (opt_uniform_atomic_stage_allowed && OPT(nir_opt_uniform_atomics, false)) {
       const nir_lower_subgroups_options subgroups_options = {
          .ballot_bit_size = 32,
          .ballot_components = 1,

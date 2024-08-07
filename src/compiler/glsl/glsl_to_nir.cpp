@@ -1730,13 +1730,24 @@ nir_visitor::visit(ir_expression *ir)
    case ir_binop_interpolate_at_sample: {
       ir_dereference *deref = ir->operands[0]->as_dereference();
       ir_swizzle *swizzle = NULL;
+      ir_expression *precision_op = NULL;
       if (!deref) {
-         /* the api does not allow a swizzle here, but the varying packing code
-          * may have pushed one into here.
-          */
-         swizzle = ir->operands[0]->as_swizzle();
-         assert(swizzle);
-         deref = swizzle->val->as_dereference();
+         precision_op = ir->operands[0]->as_expression();
+         if (precision_op) {
+            /* For some builtins precision is lowered to mediump for certain
+             * parameters that ignore precision. For example for Interpolation
+             * and Bitfield functions.
+             */
+            assert(precision_op->operation == ir_unop_f2fmp);
+            deref = precision_op->operands[0]->as_dereference();
+         }
+
+         if (!deref) {
+            swizzle = ir->operands[0]->as_swizzle();
+            assert(swizzle);
+            deref = swizzle->val->as_dereference();
+         }
+
          assert(deref);
       }
 
@@ -1776,6 +1787,10 @@ nir_visitor::visit(ir_expression *ir)
 
          result = nir_swizzle(&b, result, swiz,
                               swizzle->type->vector_elements);
+      }
+
+      if (precision_op) {
+         result = nir_build_alu(&b, nir_op_f2fmp, result, NULL, NULL, NULL);
       }
 
       return;
@@ -2380,20 +2395,12 @@ nir_visitor::visit(ir_texture *ir)
    instr->is_sparse = ir->is_sparse;
 
    nir_deref_instr *sampler_deref = evaluate_deref(ir->sampler);
+   nir_def *tex_intrin = nir_deref_texture_src(&b, 32, &sampler_deref->def);
 
-   /* check for bindless handles */
-   if (!nir_deref_mode_is(sampler_deref, nir_var_uniform) ||
-       (nir_deref_instr_get_variable(sampler_deref) &&
-        nir_deref_instr_get_variable(sampler_deref)->data.bindless)) {
-      nir_def *load = nir_load_deref(&b, sampler_deref);
-      instr->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, load);
-      instr->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, load);
-   } else {
-      instr->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref,
-                                          &sampler_deref->def);
-      instr->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref,
-                                          &sampler_deref->def);
-   }
+   instr->src[0] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref_intrinsic,
+                                       tex_intrin);
+   instr->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref_intrinsic,
+                                       tex_intrin);
 
    unsigned src_number = 2;
 

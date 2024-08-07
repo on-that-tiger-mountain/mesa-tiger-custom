@@ -1259,6 +1259,10 @@ lvp_physical_device_init(struct lvp_physical_device *device,
       device->vk.supported_extensions.EXT_external_memory_dma_buf = true;
    if ((supported_dmabuf_bits & dmabuf_bits) == dmabuf_bits)
       device->vk.supported_extensions.EXT_image_drm_format_modifier = true;
+   if (device->pscreen->get_param(device->pscreen, PIPE_CAP_NATIVE_FENCE_FD)) {
+      device->vk.supported_extensions.KHR_external_semaphore_fd = true;
+      device->vk.supported_extensions.KHR_external_fence_fd = true;
+   }
 #endif
 
    /* SNORM blending on llvmpipe fails CTS - disable by default */
@@ -1484,8 +1488,11 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceMemoryProperties2(
    VkPhysicalDeviceMemoryBudgetPropertiesEXT *props = vk_find_struct(pMemoryProperties, PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT);
    if (props) {
       props->heapBudget[0] = pMemoryProperties->memoryProperties.memoryHeaps[0].size;
-      os_get_available_system_memory(&props->heapUsage[0]);
-      props->heapUsage[0] = props->heapBudget[0] - props->heapUsage[0];
+      if (os_get_available_system_memory(&props->heapUsage[0])) {
+         props->heapUsage[0] = props->heapBudget[0] - props->heapUsage[0];
+      } else {
+         props->heapUsage[0] = 0;
+      }
       memset(&props->heapBudget[1], 0, sizeof(props->heapBudget[0]) * (VK_MAX_MEMORY_HEAPS - 1));
       memset(&props->heapUsage[1], 0, sizeof(props->heapUsage[0]) * (VK_MAX_MEMORY_HEAPS - 1));
    }
@@ -2505,9 +2512,24 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceExternalFenceProperties(
    const VkPhysicalDeviceExternalFenceInfo    *pExternalFenceInfo,
    VkExternalFenceProperties                  *pExternalFenceProperties)
 {
-   pExternalFenceProperties->exportFromImportedHandleTypes = 0;
-   pExternalFenceProperties->compatibleHandleTypes = 0;
-   pExternalFenceProperties->externalFenceFeatures = 0;
+   LVP_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
+   const VkExternalFenceHandleTypeFlagBits handle_type = pExternalFenceInfo->handleType;
+
+   if (handle_type == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT &&
+       physical_device->pscreen->get_param(
+          physical_device->pscreen, PIPE_CAP_NATIVE_FENCE_FD)) {
+      pExternalFenceProperties->exportFromImportedHandleTypes =
+         VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+      pExternalFenceProperties->compatibleHandleTypes =
+         VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+       pExternalFenceProperties->externalFenceFeatures =
+          VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT |
+          VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT;
+   } else {
+      pExternalFenceProperties->exportFromImportedHandleTypes = 0;
+      pExternalFenceProperties->compatibleHandleTypes = 0;
+      pExternalFenceProperties->externalFenceFeatures = 0;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceExternalSemaphoreProperties(
@@ -2515,9 +2537,28 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceExternalSemaphoreProperties(
    const VkPhysicalDeviceExternalSemaphoreInfo *pExternalSemaphoreInfo,
    VkExternalSemaphoreProperties               *pExternalSemaphoreProperties)
 {
-   pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
-   pExternalSemaphoreProperties->compatibleHandleTypes = 0;
-   pExternalSemaphoreProperties->externalSemaphoreFeatures = 0;
+   LVP_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
+   const VkSemaphoreTypeCreateInfo *type_info =
+      vk_find_struct_const(pExternalSemaphoreInfo->pNext, SEMAPHORE_TYPE_CREATE_INFO);
+   const VkSemaphoreType type = !type_info ? VK_SEMAPHORE_TYPE_BINARY : type_info->semaphoreType;
+   const VkExternalSemaphoreHandleTypeFlagBits handle_type = pExternalSemaphoreInfo->handleType;
+
+   if (type == VK_SEMAPHORE_TYPE_BINARY &&
+       handle_type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT &&
+       physical_device->pscreen->get_param(
+          physical_device->pscreen, PIPE_CAP_NATIVE_FENCE_FD)) {
+      pExternalSemaphoreProperties->exportFromImportedHandleTypes =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+      pExternalSemaphoreProperties->compatibleHandleTypes =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+      pExternalSemaphoreProperties->externalSemaphoreFeatures =
+         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
+         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+   } else {
+      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
+      pExternalSemaphoreProperties->compatibleHandleTypes = 0;
+      pExternalSemaphoreProperties->externalSemaphoreFeatures = 0;
+   }
 }
 
 static const VkTimeDomainEXT lvp_time_domains[] = {

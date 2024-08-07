@@ -22,7 +22,7 @@
  */
 
 /**
- * @file brw_lower_logical_sends.cpp
+ * @file
  */
 
 #include "brw_eu.h"
@@ -1124,13 +1124,16 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
    inst->mlen = mlen;
    inst->header_size = header_size;
    inst->sfid = BRW_SFID_SAMPLER;
+   uint sampler_ret_type = brw_type_size_bits(inst->dst.type) == 16
+      ? GFX8_SAMPLER_RETURN_FORMAT_16BITS
+      : GFX8_SAMPLER_RETURN_FORMAT_32BITS;
    if (surface.file == IMM &&
        (sampler.file == IMM || sampler_handle.file != BAD_FILE)) {
       inst->desc = brw_sampler_desc(devinfo, surface.ud,
                                     sampler.file == IMM ? sampler.ud % 16 : 0,
                                     msg_type,
                                     simd_mode,
-                                    0 /* return_format unused on gfx7+ */);
+                                    sampler_ret_type);
       inst->src[0] = brw_imm_ud(0);
       inst->src[1] = brw_imm_ud(0);
    } else if (surface_handle.file != BAD_FILE) {
@@ -1140,7 +1143,7 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
                                     sampler.file == IMM ? sampler.ud % 16 : 0,
                                     msg_type,
                                     simd_mode,
-                                    0 /* return_format unused on gfx7+ */);
+                                    sampler_ret_type);
 
       /* For bindless samplers, the entire address is included in the message
        * header so we can leave the portion in the message descriptor 0.
@@ -1166,7 +1169,7 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
                                     0, /* sampler */
                                     msg_type,
                                     simd_mode,
-                                    0 /* return_format unused on gfx7+ */);
+                                    sampler_ret_type);
       const fs_builder ubld = bld.group(1, 0).exec_all();
       brw_reg desc = ubld.vgrf(BRW_TYPE_UD);
       if (surface.equals(sampler)) {
@@ -1458,7 +1461,7 @@ lower_surface_logical_send(const fs_builder &bld, fs_inst *inst)
       assert(!is_surface_access);
       fs_builder ubld = bld.exec_all().group(8, 0);
       header = ubld.vgrf(BRW_TYPE_UD);
-      ubld.emit(SHADER_OPCODE_SCRATCH_HEADER, header);
+      ubld.emit(SHADER_OPCODE_SCRATCH_HEADER, header, brw_ud8_grf(0, 0));
    }
    const unsigned header_sz = header.file != BAD_FILE ? 1 : 0;
 
@@ -1944,7 +1947,7 @@ lower_surface_block_logical_send(const fs_builder &bld, fs_inst *inst)
    brw_reg header = ubld.vgrf(BRW_TYPE_UD);
 
    if (is_stateless)
-      ubld.emit(SHADER_OPCODE_SCRATCH_HEADER, header);
+      ubld.emit(SHADER_OPCODE_SCRATCH_HEADER, header, brw_ud8_grf(0, 0));
    else
       ubld.MOV(header, brw_imm_d(0));
 

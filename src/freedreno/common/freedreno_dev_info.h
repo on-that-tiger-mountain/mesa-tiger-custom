@@ -56,6 +56,10 @@ struct fd_dev_info {
    /* Information for private memory calculations */
    uint32_t fibers_per_sp;
 
+   uint32_t threadsize_base;
+
+   uint32_t max_waves;
+
    /* number of CCU is always equal to the number of SP */
    union {
       uint32_t num_sp_cores;
@@ -265,6 +269,12 @@ struct fd_dev_info {
        */
       bool fs_must_have_non_zero_constlen_quirk;
 
+      /* On a750 there is a hardware bug where certain VPC sizes in a GS with
+       * an input primitive type that is a triangle with adjacency can hang
+       * with a high enough vertex count.
+       */
+      bool gs_vpc_adjacency_quirk;
+
       /* On a740 TPL1_DBG_ECO_CNTL1.TP_UBWC_FLAG_HINT must be the same between
        * all drivers in the system, somehow having different values affects
        * BLIT_OP_SCALE. We cannot automatically match blob's value, so the
@@ -273,6 +283,13 @@ struct fd_dev_info {
       bool enable_tp_ubwc_flag_hint;
 
       bool storage_8bit;
+
+      /* A750+ added a special flag that allows HW to correctly interpret UBWC, including
+       * UBWC fast-clear when casting image to a different format permitted by Vulkan.
+       * So it's possible to have UBWC enabled for image that has e.g. R32_UINT and
+       * R8G8B8A8_UNORM in the mutable formats list.
+       */
+      bool ubwc_all_formats_compatible;
    } a7xx;
 };
 

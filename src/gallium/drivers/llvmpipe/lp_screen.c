@@ -134,6 +134,8 @@ llvmpipe_get_param(struct pipe_screen *screen, enum pipe_cap param)
          return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
       else
          return DRM_PRIME_CAP_IMPORT;
+   case PIPE_CAP_NATIVE_FENCE_FD:
+      return lscreen->dummy_sync_fd != -1;
 #endif
    case PIPE_CAP_NPOT_TEXTURES:
    case PIPE_CAP_MIXED_FRAMEBUFFER_SIZES:
@@ -930,10 +932,12 @@ llvmpipe_destroy_screen(struct pipe_screen *_screen)
    close(screen->udmabuf_fd);
 #endif
 
+#if DETECT_OS_LINUX
    util_vma_heap_finish(&screen->mem_heap);
 
    close(screen->fd_mem_alloc);
    mtx_destroy(&screen->mem_mutex);
+#endif
    mtx_destroy(&screen->rast_mutex);
    mtx_destroy(&screen->cs_mutex);
    FREE(screen);
@@ -1173,17 +1177,20 @@ llvmpipe_create_screen(struct sw_winsys *winsys)
 
 #ifdef HAVE_LINUX_UDMABUF_H
    screen->udmabuf_fd = open("/dev/udmabuf", O_RDWR);
+   llvmpipe_init_screen_fence_funcs(&screen->base);
 #endif
-
-   screen->fd_mem_alloc = os_create_anonymous_file(0, "allocation fd");
-   (void) mtx_init(&screen->mem_mutex, mtx_plain);
 
    uint64_t alignment;
    if (!os_get_page_size(&alignment))
       alignment = 256;
 
+#if DETECT_OS_LINUX
+   (void) mtx_init(&screen->mem_mutex, mtx_plain);
+
    util_vma_heap_init(&screen->mem_heap, alignment, UINT64_MAX - alignment);
    screen->mem_heap.alloc_high = false;
+   screen->fd_mem_alloc = os_create_anonymous_file(0, "allocation fd");
+#endif
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
             "llvmpipe (LLVM " MESA_LLVM_VERSION_STRING ", %u bits)",

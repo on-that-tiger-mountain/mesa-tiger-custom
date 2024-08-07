@@ -48,6 +48,8 @@
 #include <vndk/hardware_buffer.h>
 #endif
 
+uint64_t os_page_size = 4096;
+
 static int
 tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
 {
@@ -207,13 +209,14 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_shader_subgroup_extended_types = true,
+      .KHR_shader_subgroup_uniform_control_flow = true,
       .KHR_shader_terminate_invocation = true,
       .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
-   #ifdef TU_USE_WSI_PLATFORM
+#ifdef TU_USE_WSI_PLATFORM
       .KHR_swapchain = true,
       .KHR_swapchain_mutable_format = true,
-   #endif
+#endif
       .KHR_synchronization2 = true,
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
@@ -234,6 +237,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_depth_clip_enable = true,
       .EXT_descriptor_buffer = true,
       .EXT_descriptor_indexing = true,
+      .EXT_device_address_binding_report = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
@@ -482,6 +486,9 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_KHR_shader_float_controls2 */
    features->shaderFloatControls2 = true;
 
+   /* VK_KHR_shader_subgroup_uniform_control_flow */
+   features->shaderSubgroupUniformControlFlow = true;
+
    /* VK_KHR_vertex_attribute_divisor */
    features->vertexAttributeInstanceRateDivisor = true;
    features->vertexAttributeInstanceRateZeroDivisor = true;
@@ -525,6 +532,9 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->descriptorBufferCaptureReplay = pdevice->has_set_iova;
    features->descriptorBufferImageLayoutIgnored = true;
    features->descriptorBufferPushDescriptors = true;
+
+   /* VK_EXT_device_address_binding_report */
+   features->reportAddressBinding = true;
 
    /* VK_EXT_extended_dynamic_state */
    features->extendedDynamicState = true;
@@ -600,9 +610,9 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->mutableDescriptorType = true;
 
    /* VK_EXT_nested_command_buffer */
-   features->nestedCommandBuffer = true,
-   features->nestedCommandBufferRendering = true,
-   features->nestedCommandBufferSimultaneousUse = true,
+   features->nestedCommandBuffer = true;
+   features->nestedCommandBufferRendering = true;
+   features->nestedCommandBufferSimultaneousUse = true;
 
    /* VK_EXT_non_seamless_cube_map */
    features->nonSeamlessCubeMap = true;
@@ -661,7 +671,8 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
    p->deviceNodeMask = 0;
    p->deviceLUIDValid = false;
 
-   p->subgroupSize = pdevice->info->a6xx.supports_double_threadsize ? 128 : 64;
+   p->subgroupSize = pdevice->info->a6xx.supports_double_threadsize ?
+      pdevice->info->threadsize_base * 2 : pdevice->info->threadsize_base;
    p->subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT;
    p->subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT |
                                     VK_SUBGROUP_FEATURE_VOTE_BIT |
@@ -778,11 +789,10 @@ static void
 tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
                                       struct vk_properties *p)
 {
-   /* TODO move threadsize_base and max_waves to fd_dev_info and use them here */
-   p->minSubgroupSize = 64; /* threadsize_base */
-   p->maxSubgroupSize =
-      pdevice->info->a6xx.supports_double_threadsize ? 128 : 64;
-   p->maxComputeWorkgroupSubgroups = 16; /* max_waves */
+   p->minSubgroupSize = pdevice->info->threadsize_base;
+   p->maxSubgroupSize = pdevice->info->a6xx.supports_double_threadsize ?
+      pdevice->info->threadsize_base * 2 : pdevice->info->threadsize_base;
+   p->maxComputeWorkgroupSubgroups = pdevice->info->max_waves;
    p->requiredSubgroupSizeStages = VK_SHADER_STAGE_ALL;
 
    p->maxInlineUniformBlockSize = MAX_INLINE_UBO_RANGE;
@@ -902,7 +912,9 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxComputeWorkGroupCount[0] =
       props->maxComputeWorkGroupCount[1] =
       props->maxComputeWorkGroupCount[2] = 65535;
-   props->maxComputeWorkGroupInvocations = pdevice->info->a6xx.supports_double_threadsize ? 2048 : 1024;
+   props->maxComputeWorkGroupInvocations = pdevice->info->a6xx.supports_double_threadsize ?
+      pdevice->info->threadsize_base * 2 * pdevice->info->max_waves :
+      pdevice->info->threadsize_base * pdevice->info->max_waves;
    props->maxComputeWorkGroupSize[0] =
       props->maxComputeWorkGroupSize[1] =
       props->maxComputeWorkGroupSize[2] = 1024;
@@ -1016,13 +1028,13 @@ tu_get_properties(struct tu_physical_device *pdevice,
    /* VK_KHR_vertex_attribute_divisor */
    props->maxVertexAttribDivisor = UINT32_MAX;
    props->supportsNonZeroFirstInstance = true;
-   
+
    /* VK_EXT_custom_border_color */
    props->maxCustomBorderColorSamplers = TU_BORDER_COLOR_COUNT;
 
    /* VK_KHR_performance_query */
    props->allowCommandBufferQueryCopies = false;
-   
+
    /* VK_EXT_robustness2 */
    /* see write_buffer_descriptor() */
    props->robustStorageBufferAccessSizeAlignment = 4;
@@ -1034,8 +1046,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->transformFeedbackPreservesTriangleFanProvokingVertex = false;
 
    /* VK_KHR_line_rasterization */
-  props->lineSubPixelPrecisionBits = 8;
-  
+   props->lineSubPixelPrecisionBits = 8;
+
    /* VK_EXT_physical_device_drm */
    props->drmHasPrimary = pdevice->has_master;
    props->drmPrimaryMajor = pdevice->master_major;
@@ -1053,20 +1065,19 @@ tu_get_properties(struct tu_physical_device *pdevice,
           sizeof(props->shaderModuleIdentifierAlgorithmUUID));
 
    /* VK_EXT_map_memory_placed */
-   uint64_t os_page_size = 4096;
    os_get_page_size(&os_page_size);
-   props->minPlacedMemoryMapAlignment = os_page_size,
+   props->minPlacedMemoryMapAlignment = os_page_size;
 
    /* VK_EXT_multi_draw */
    props->maxMultiDrawCount = 2048;
 
    /* VK_EXT_nested_command_buffer */
-   props->maxCommandBufferNestingLevel = UINT32_MAX,
+   props->maxCommandBufferNestingLevel = UINT32_MAX;
 
    /* VK_EXT_graphics_pipeline_library */
    props->graphicsPipelineLibraryFastLinking = true;
    props->graphicsPipelineLibraryIndependentInterpolationDecoration = true;
-   
+
    /* VK_EXT_extended_dynamic_state3 */
    props->dynamicPrimitiveTopologyUnrestricted = true;
 
@@ -1111,7 +1122,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->combinedImageSamplerDensityMapDescriptorSize = 2 * A6XX_TEX_CONST_DWORDS * 4;
 
    /* VK_EXT_legacy_vertex_attributes */
-   props->nativeUnalignedPerformance = true,
+   props->nativeUnalignedPerformance = true;
 
    /* VK_EXT_fragment_density_map*/
    props->minFragmentDensityTexelSize = (VkExtent2D) { MIN_FDM_TEXEL_SIZE, MIN_FDM_TEXEL_SIZE };
@@ -1229,6 +1240,10 @@ tu_physical_device_init(struct tu_physical_device *device,
                                  "cannot generate UUID");
       goto fail_free_name;
    }
+
+   device->level1_dcache_size = tu_get_l1_dcache_size();
+   device->has_cached_non_coherent_memory =
+      device->level1_dcache_size > 0 && !DETECT_ARCH_ARM;
 
    device->memory.type_count = 1;
    device->memory.types[0] =
@@ -1691,19 +1706,19 @@ tu_device_get_u_trace(struct tu_device *device)
 }
 
 static void*
-tu_trace_create_ts_buffer(struct u_trace_context *utctx, uint32_t size)
+tu_trace_create_buffer(struct u_trace_context *utctx, uint64_t size_B)
 {
    struct tu_device *device =
       container_of(utctx, struct tu_device, trace_context);
 
    struct tu_bo *bo;
-   tu_bo_init_new(device, &bo, size, TU_BO_ALLOC_INTERNAL_RESOURCE, "trace");
+   tu_bo_init_new(device, NULL, &bo, size_B, TU_BO_ALLOC_INTERNAL_RESOURCE, "trace");
 
    return bo;
 }
 
 static void
-tu_trace_destroy_ts_buffer(struct u_trace_context *utctx, void *timestamps)
+tu_trace_destroy_buffer(struct u_trace_context *utctx, void *timestamps)
 {
    struct tu_device *device =
       container_of(utctx, struct tu_device, trace_context);
@@ -1715,18 +1730,16 @@ tu_trace_destroy_ts_buffer(struct u_trace_context *utctx, void *timestamps)
 template <chip CHIP>
 static void
 tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
-                   unsigned idx, uint32_t)
+                   uint64_t offset_B, uint32_t)
 {
    struct tu_bo *bo = (struct tu_bo *) timestamps;
    struct tu_cs *ts_cs = (struct tu_cs *) cs;
-
-   unsigned ts_offset = idx * sizeof(uint64_t);
 
    if (CHIP == A6XX) {
       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
       tu_cs_emit(ts_cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) |
                            CP_EVENT_WRITE_0_TIMESTAMP);
-      tu_cs_emit_qw(ts_cs, bo->iova + ts_offset);
+      tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
       tu_cs_emit(ts_cs, 0x00000000);
    } else {
       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE7, 3);
@@ -1735,13 +1748,13 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
                                           .write_dst = EV_DST_RAM,
                                           .write_enabled = true)
                            .value);
-      tu_cs_emit_qw(ts_cs, bo->iova + ts_offset);
+      tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
    }
 }
 
 static uint64_t
 tu_trace_read_ts(struct u_trace_context *utctx,
-                 void *timestamps, unsigned idx, void *flush_data)
+                 void *timestamps, uint64_t offset_B, void *flush_data)
 {
    struct tu_device *device =
       container_of(utctx, struct tu_device, trace_context);
@@ -1750,7 +1763,7 @@ tu_trace_read_ts(struct u_trace_context *utctx,
       (struct tu_u_trace_submission_data *) flush_data;
 
    /* Only need to stall on results for the first entry: */
-   if (idx == 0) {
+   if (offset_B == 0) {
       tu_device_wait_u_trace(device, submission_data->syncobj);
    }
 
@@ -1758,13 +1771,13 @@ tu_trace_read_ts(struct u_trace_context *utctx,
       return U_TRACE_NO_TIMESTAMP;
    }
 
-   uint64_t *ts = (uint64_t *) bo->map;
+   uint64_t *ts = (uint64_t *) ((char *)bo->map + offset_B);
 
    /* Don't translate the no-timestamp marker: */
-   if (ts[idx] == U_TRACE_NO_TIMESTAMP)
+   if (*ts == U_TRACE_NO_TIMESTAMP)
       return U_TRACE_NO_TIMESTAMP;
 
-   return tu_device_ticks_to_ns(device, ts[idx]);
+   return tu_device_ticks_to_ns(device, *ts);
 }
 
 static void
@@ -1779,19 +1792,19 @@ tu_trace_delete_flush_data(struct u_trace_context *utctx, void *flush_data)
 }
 
 void
-tu_copy_timestamp_buffer(struct u_trace_context *utctx, void *cmdstream,
-                         void *ts_from, uint32_t from_offset,
-                         void *ts_to, uint32_t to_offset,
-                         uint32_t count)
+tu_copy_buffer(struct u_trace_context *utctx, void *cmdstream,
+               void *ts_from, uint64_t from_offset_B,
+               void *ts_to, uint64_t to_offset_B,
+               uint64_t size_B)
 {
    struct tu_cs *cs = (struct tu_cs *) cmdstream;
    struct tu_bo *bo_from = (struct tu_bo *) ts_from;
    struct tu_bo *bo_to = (struct tu_bo *) ts_to;
 
    tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
-   tu_cs_emit(cs, count * sizeof(uint64_t) / sizeof(uint32_t));
-   tu_cs_emit_qw(cs, bo_from->iova + from_offset * sizeof(uint64_t));
-   tu_cs_emit_qw(cs, bo_to->iova + to_offset * sizeof(uint64_t));
+   tu_cs_emit(cs, size_B / sizeof(uint32_t));
+   tu_cs_emit_qw(cs, bo_from->iova + from_offset_B);
+   tu_cs_emit_qw(cs, bo_to->iova + to_offset_B);
 }
 
 /* Special helpers instead of u_trace_begin_iterator()/u_trace_end_iterator()
@@ -1857,7 +1870,7 @@ tu_create_copy_timestamp_cs(struct tu_cmd_buffer *cmdbuf, struct tu_cs** cs,
    u_trace_clone_append(tu_cmd_begin_iterator(cmdbuf),
                         tu_cmd_end_iterator(cmdbuf),
                         *trace_copy, *cs,
-                        tu_copy_timestamp_buffer);
+                        tu_copy_buffer);
 
    tu_cs_emit_wfi(*cs);
 
@@ -2251,7 +2264,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    if (physical_device->has_set_iova) {
       mtx_init(&device->vma_mutex, mtx_plain);
       util_vma_heap_init(&device->vma, physical_device->va_start,
-                         ROUND_DOWN_TO(physical_device->va_size, 4096));
+                         ROUND_DOWN_TO(physical_device->va_size, os_page_size));
    }
 
    if (TU_DEBUG(BOS))
@@ -2356,7 +2369,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    result = tu_bo_init_new(
-      device, &device->global_bo, global_size,
+      device, NULL, &device->global_bo, global_size,
       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_ALLOW_DUMP |
                                 TU_BO_ALLOC_INTERNAL_RESOURCE),
       "global");
@@ -2507,10 +2520,14 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->submit_count = 0;
    u_trace_context_init(&device->trace_context, device,
-                     tu_trace_create_ts_buffer,
-                     tu_trace_destroy_ts_buffer,
+                     sizeof(uint64_t),
+                     0,
+                     tu_trace_create_buffer,
+                     tu_trace_destroy_buffer,
                      TU_CALLX(device, tu_trace_record_ts),
                      tu_trace_read_ts,
+                     NULL,
+                     NULL,
                      tu_trace_delete_flush_data);
 
    tu_breadcrumbs_init(device);
@@ -2707,7 +2724,7 @@ tu_get_scratch_bo(struct tu_device *dev, uint64_t size, struct tu_bo **bo)
    }
 
    unsigned bo_size = 1ull << size_log2;
-   VkResult result = tu_bo_init_new(dev, &dev->scratch_bos[index].bo, bo_size,
+   VkResult result = tu_bo_init_new(dev, NULL, &dev->scratch_bos[index].bo, bo_size,
                                     TU_BO_ALLOC_INTERNAL_RESOURCE, "scratch");
    if (result != VK_SUCCESS) {
       mtx_unlock(&dev->scratch_bos[index].construct_mtx);
@@ -2854,8 +2871,8 @@ tu_AllocateMemory(VkDevice _device,
       VkMemoryPropertyFlags mem_property =
          device->physical_device->memory.types[pAllocateInfo->memoryTypeIndex];
       result = tu_bo_init_new_explicit_iova(
-         device, &mem->bo, pAllocateInfo->allocationSize, client_address,
-         mem_property, alloc_flags, name);
+         device, &mem->vk.base, &mem->bo, pAllocateInfo->allocationSize,
+         client_address, mem_property, alloc_flags, name);
    }
 
    if (result == VK_SUCCESS) {
@@ -2958,6 +2975,45 @@ tu_UnmapMemory2KHR(VkDevice _device, const VkMemoryUnmapInfoKHR *pMemoryUnmapInf
       return VK_SUCCESS;
 
    return tu_bo_unmap(device, mem->bo, pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT);
+}
+static VkResult
+sync_cache(VkDevice _device,
+           enum tu_mem_sync_op op,
+           uint32_t count,
+           const VkMappedMemoryRange *ranges)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+
+   if (!device->physical_device->has_cached_non_coherent_memory) {
+      tu_finishme(
+         "data cache clean and invalidation are unsupported on this arch!");
+      return VK_SUCCESS;
+   }
+
+   for (uint32_t i = 0; i < count; i++) {
+      VK_FROM_HANDLE(tu_device_memory, mem, ranges[i].memory);
+      tu_bo_sync_cache(device, mem->bo, ranges[i].offset, ranges[i].size, op);
+   }
+
+   return VK_SUCCESS;
+}
+
+VkResult
+tu_FlushMappedMemoryRanges(VkDevice _device,
+                           uint32_t memoryRangeCount,
+                           const VkMappedMemoryRange *pMemoryRanges)
+{
+   return sync_cache(_device, TU_MEM_SYNC_CACHE_TO_GPU, memoryRangeCount,
+                     pMemoryRanges);
+}
+
+VkResult
+tu_InvalidateMappedMemoryRanges(VkDevice _device,
+                                uint32_t memoryRangeCount,
+                                const VkMappedMemoryRange *pMemoryRanges)
+{
+   return sync_cache(_device, TU_MEM_SYNC_CACHE_FROM_GPU, memoryRangeCount,
+                     pMemoryRanges);
 }
 
 VKAPI_ATTR void VKAPI_CALL

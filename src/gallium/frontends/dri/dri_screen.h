@@ -91,6 +91,7 @@ struct dri_screen
    unsigned int api_mask;
 
    bool throttle;
+   bool dmabuf_import;
 
    struct st_config_options options;
 
@@ -110,11 +111,6 @@ struct dri_screen
    enum pipe_texture_target target;
 
    bool swrast_no_present;
-
-   /* hooks filled in by dri2 & drisw */
-   __DRIimage * (*lookup_egl_image)(struct dri_screen *ctx, void *handle);
-   bool (*validate_egl_image)(struct dri_screen *ctx, void *handle);
-   __DRIimage * (*lookup_egl_image_validated)(struct dri_screen *ctx, void *handle);
 
    /* DRI exts that vary based on gallium pipe_screen caps. */
    __DRIimageExtension image_extension;

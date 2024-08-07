@@ -68,8 +68,6 @@ struct radv_sqtt_shaders_reloc {
 struct radv_graphics_pipeline {
    struct radv_pipeline base;
 
-   struct radv_pipeline_layout layout;
-
    bool uses_drawid;
    bool uses_baseinstance;
 
@@ -108,8 +106,6 @@ struct radv_graphics_pipeline {
 
    unsigned rast_prim;
 
-   /* For vk_graphics_pipeline_state */
-   void *state_data;
 
    /* Custom blend mode for internal operations. */
    unsigned custom_blend_mode;
@@ -145,6 +141,11 @@ struct radv_graphics_lib_pipeline {
    struct radv_graphics_pipeline base;
 
    struct vk_graphics_pipeline_state graphics_state;
+
+   /* For vk_graphics_pipeline_state */
+   void *state_data;
+
+   struct radv_pipeline_layout layout;
 
    VkGraphicsPipelineLibraryFlagsEXT lib_flags;
 
@@ -628,7 +629,6 @@ struct radv_graphics_pipeline_create_info {
    bool db_stencil_clear;
    bool depth_compress_disable;
    bool stencil_compress_disable;
-   bool resummarize_enable;
    uint32_t custom_blend_mode;
 };
 

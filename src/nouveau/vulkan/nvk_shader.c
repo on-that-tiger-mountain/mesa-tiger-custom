@@ -66,7 +66,7 @@ nvk_nak_stages(const struct nv_device_info *info)
 
    const char *env_str = getenv("NVK_USE_NAK");
    if (env_str == NULL)
-      return info->cls_eng3d >= VOLTA_A ? all : 0;
+      return info->cls_eng3d >= MAXWELL_A ? all : 0;
    else
       return parse_debug_string(env_str, flags);
 }
@@ -185,8 +185,9 @@ nvk_populate_fs_key(struct nak_fs_key *key,
 {
    memset(key, 0, sizeof(*key));
 
-   key->sample_locations_cb = 0;
+   key->sample_info_cb = 0;
    key->sample_locations_offset = nvk_root_descriptor_offset(draw.sample_locations);
+   key->sample_masks_offset = nvk_root_descriptor_offset(draw.sample_masks);
 
    /* Turn underestimate on when no state is availaible or if explicitly set */
    if (state == NULL || state->rs == NULL ||
@@ -616,7 +617,9 @@ nvk_shader_upload(struct nvk_device *dev, struct nvk_shader *shader)
 
    uint32_t data_offset = 0;
    if (shader->data_size > 0) {
-      total_size = align(total_size, nvk_min_cbuf_alignment(&pdev->info));
+      uint32_t cbuf_alignment = nvk_min_cbuf_alignment(&pdev->info);
+      alignment = MAX2(alignment, cbuf_alignment);
+      total_size = align(total_size, cbuf_alignment);
       data_offset = total_size;
       total_size += shader->data_size;
    }
@@ -732,8 +735,7 @@ nvk_compile_shader(struct nvk_device *dev,
    }
 
    if (info->stage == MESA_SHADER_FRAGMENT) {
-      if (shader->info.fs.reads_sample_mask ||
-          shader->info.fs.uses_sample_shading) {
+      if (shader->info.fs.uses_sample_shading) {
          shader->min_sample_shading = 1;
       } else if (state != NULL && state->ms != NULL &&
                  state->ms->sample_shading_enable) {
@@ -913,6 +915,13 @@ nvk_shader_get_executable_statistics(
                           statistics, statistic_count);
 
    assert(executable_index == 0);
+
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      WRITE_STR(stat->name, "Instruction count");
+      WRITE_STR(stat->description, "Number of instructions used by this shader");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = shader->info.num_instrs;
+   }
 
    vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
       WRITE_STR(stat->name, "Code Size");

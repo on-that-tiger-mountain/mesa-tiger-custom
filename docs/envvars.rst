@@ -13,10 +13,6 @@ LibGL environment variables
    If defined debug information will be printed to stderr. If set to
    ``verbose`` additional information will be printed.
 
-.. envvar:: LIBGL_DRIVERS_PATH
-
-   colon-separated list of paths to search for DRI drivers
-
 .. envvar:: LIBGL_ALWAYS_INDIRECT
 
    if set to ``true``, forces an indirect rendering context/connection.
@@ -205,8 +201,8 @@ Core Mesa environment variables
 
    if set, determines the directory to be used for the on-disk cache of
    compiled shader programs. If this variable is not set, then the cache
-   will be stored in ``$XDG_CACHE_HOME/mesa_shader_cache`` (if that
-   variable is set), or else within ``.cache/mesa_shader_cache`` within
+   will be stored in ``$XDG_CACHE_HOME/mesa_shader_cache_db`` (if that
+   variable is set), or else within ``.cache/mesa_shader_cache_db`` within
    the user's home directory.
 
 .. envvar:: MESA_SHADER_CACHE_SHOW_STATS
@@ -217,16 +213,25 @@ Core Mesa environment variables
 .. envvar:: MESA_DISK_CACHE_SINGLE_FILE
 
    if set to 1, enables the single file Fossilize DB on-disk shader
-   cache implementation instead of the default multi-file cache
-   implementation. This implementation reduces the overall disk usage by
-   the shader cache and also allows for loading of precompiled cache
-   DBs via :envvar:`MESA_DISK_CACHE_READ_ONLY_FOZ_DBS` or
+   cache implementation instead of the default Mesa-DB cache
+   implementation. This implementation allows for loading of precompiled
+   cache DBs via :envvar:`MESA_DISK_CACHE_READ_ONLY_FOZ_DBS` or
    :envvar:`MESA_DISK_CACHE_READ_ONLY_FOZ_DBS_DYNAMIC_LIST`. This
    implementation does not support cache size limits via
    :envvar:`MESA_SHADER_CACHE_MAX_SIZE`. If
    :envvar:`MESA_SHADER_CACHE_DIR` is not set, the cache will be stored
    in ``$XDG_CACHE_HOME/mesa_shader_cache_sf`` (if that variable is set)
    or else within ``.cache/mesa_shader_cache_sf`` within the user's home
+   directory.
+
+.. envvar:: MESA_DISK_CACHE_MULTI_FILE
+
+   if set to 1, enables the multi file on-disk shader cache implementation
+   instead of the default Mesa-DB cache implementation.
+   This implementation increases the overall disk usage.
+   If :envvar:`MESA_SHADER_CACHE_DIR` is not set, the cache will be stored
+   in ``$XDG_CACHE_HOME/mesa_shader_cache`` (if that variable is set)
+   or else within ``.cache/mesa_shader_cache`` within the user's home
    directory.
 
 .. envvar:: MESA_DISK_CACHE_READ_ONLY_FOZ_DBS
@@ -239,18 +244,6 @@ Core Mesa environment variables
    ``MESA_DISK_CACHE_SINGLE_FILE=filename1`` refers to ``filename1.foz``
    and ``filename1_idx.foz``. A limit of 8 DBs can be loaded and this limit
    is shared with :envvar:`MESA_DISK_CACHE_READ_ONLY_FOZ_DBS_DYNAMIC_LIST`.
-
-.. envvar:: MESA_DISK_CACHE_DATABASE
-
-   if set to 1, enables the Mesa-DB single file on-disk shader cache
-   implementation instead of the default multi-file cache implementation.
-   Like :envvar:`MESA_DISK_CACHE_SINGLE_FILE`, Mesa-DB reduces overall
-   disk usage but Mesa-DB supports cache size limits via
-   :envvar:`MESA_SHADER_CACHE_MAX_SIZE`. If
-   :envvar:`MESA_SHADER_CACHE_DIR` is not set, the cache will be stored
-   in ``$XDG_CACHE_HOME/mesa_shader_cache_db`` (if that variable is set)
-   or else within ``.cache/mesa_shader_cache_db`` within the user's home
-   directory.
 
 .. envvar:: MESA_DISK_CACHE_DATABASE_NUM_PARTS
 
@@ -634,6 +627,8 @@ Intel driver environment variables
       dump shader assembly for vertex shaders
    ``wm``
       dump shader assembly for fragment shaders (same as ``fs``)
+   ``cl-quiet``
+      quiets the OpenCL warnings recommending use of Intel compute-runtime
 
 .. envvar:: INTEL_DECODE
 
@@ -1120,6 +1115,8 @@ Rusticl environment variables
 
    - ``allow_invalid_spirv`` disables validation of any input SPIR-V
    - ``clc`` dumps all OpenCL C source being compiled
+   - ``perf`` prints a warning when hitting slow paths once
+   - ``perfspam`` same as perf, but doesn't skip same warnings
    - ``program`` dumps compilation logs to stderr
    - ``sync`` waits on the GPU to complete after every event
    - ``validate`` validates any internally generated SPIR-Vs, e.g. through compiling OpenCL C code
@@ -1465,6 +1462,20 @@ RADV driver environment variables
    decrease the resolution used for dumping the ray history resolution when capturing
    RRA traces. This allows for dumping every Nth invocation along each dispatch dimension.
 
+.. envvar:: RADV_PROFILE_PSTATE
+
+   choose the specific pstate to enter when using thread tracing or when acquiring the
+   profiling lock for performance queries.
+
+   ``standard``
+      force GPU clocks to an arbitrary fixed level
+   ``min_sclk``
+      force the shader clock to its minimum level
+   ``min_mclk``
+      force the memory clock to its minimum level
+   ``peak``
+      force GPU clocks to their maximum level, this is the default value
+
 .. envvar:: ACO_DEBUG
 
    a comma-separated list of named flags, which do various things:
@@ -1476,8 +1487,6 @@ RADV driver environment variables
       disable ACO IR validation in debug/debugoptimized builds
    ``validatera``
       validate register assignment of ACO IR and catches many RA bugs
-   ``perfwarn``
-      abort on some suboptimal code generation
    ``force-waitcnt``
       force emitting waitcnt states if there is something to wait for
    ``force-waitdeps``
@@ -1487,7 +1496,11 @@ RADV driver environment variables
    ``noopt``
       disable various optimizations
    ``nosched``
-      disable instructions scheduling
+      disable pre-RA, ILP and VOPD instruction scheduling
+   ``nosched-ilp``
+      disable ILP instruction scheduling
+   ``nosched-vopd``
+      disable VOPD instruction scheduling
    ``perfinfo``
       print information used to calculate some pipeline statistics
    ``liveinfo``
@@ -1524,6 +1537,8 @@ RadeonSI driver environment variables
       Disable DPBB. Overrules the dpbb enable option.
    ``noefc``
       Disable hardware based encoder color format conversion
+   ``lowlatencyenc``
+      Enable low latency encoding
    ``notiling``
       Disable tiling
    ``nofmask``

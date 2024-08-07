@@ -1625,6 +1625,30 @@ typedef struct nir_alu_instr {
    nir_alu_src src[];
 } nir_alu_instr;
 
+static inline bool
+nir_alu_instr_is_signed_zero_preserve(nir_alu_instr *alu)
+{
+   return nir_is_float_control_signed_zero_preserve(alu->fp_fast_math, alu->def.bit_size);
+}
+
+static inline bool
+nir_alu_instr_is_inf_preserve(nir_alu_instr *alu)
+{
+   return nir_is_float_control_inf_preserve(alu->fp_fast_math, alu->def.bit_size);
+}
+
+static inline bool
+nir_alu_instr_is_nan_preserve(nir_alu_instr *alu)
+{
+   return nir_is_float_control_nan_preserve(alu->fp_fast_math, alu->def.bit_size);
+}
+
+static inline bool
+nir_alu_instr_is_signed_zero_inf_nan_preserve(nir_alu_instr *alu)
+{
+   return nir_is_float_control_signed_zero_inf_nan_preserve(alu->fp_fast_math, alu->def.bit_size);
+}
+
 void nir_alu_src_copy(nir_alu_src *dest, const nir_alu_src *src);
 
 nir_component_mask_t
@@ -1993,9 +2017,7 @@ typedef struct nir_io_semantics {
    unsigned no_sysval_output : 1; /* whether this system value output has no
                                      effect due to current pipeline states */
    unsigned interp_explicit_strict : 1; /* preserve original vertex order */
-   unsigned per_primitive : 1; /* Per-primitive FS input (when FS is used with a mesh shader).
-                                  Note that per-primitive MS outputs are implied by
-                                  using a dedicated intrinsic, store_per_primitive_output. */
+   unsigned _pad : 1;
 } nir_io_semantics;
 
 /* Transform feedback info for 2 outputs. nir_intrinsic_store_output contains
@@ -2305,6 +2327,15 @@ typedef enum nir_tex_src_type {
     * See nir_tex_src_texture_handle,
     */
    nir_tex_src_sampler_handle,
+
+   /** Tex src intrinsic
+    *
+    * This is an intrinsic used before function inlining i.e. before we know
+    * if a bindless value has been given as function param for use as a tex
+    * src.
+    */
+   nir_tex_src_sampler_deref_intrinsic,
+   nir_tex_src_texture_deref_intrinsic,
 
    /** Plane index for multi-plane YCbCr textures */
    nir_tex_src_plane,
@@ -3682,6 +3713,37 @@ typedef enum {
     */
    nir_io_prefer_scalar_fs_inputs = BITFIELD_BIT(4),
 
+   /**
+    * Whether interpolated fragment shader vec4 slots can use load_input for
+    * a subset of its components to skip interpolation for those components.
+    * The result of such load_input is a value from a random (not necessarily
+    * provoking) vertex. If a value from the provoking vertex is required,
+    * the vec4 slot should have no load_interpolated_input instructions.
+    *
+    * This exposes the AMD capability that allows packing flat inputs with
+    * interpolated inputs in a limited number of cases. Normally, flat
+    * components must be in a separate vec4 slot to get the value from
+    * the provoking vertex. If the compiler can prove that all per-vertex
+    * values are equal (convergent, i.e. the provoking vertex doesn't matter),
+    * it can put such flat components into any interpolated vec4 slot.
+    *
+    * It should also be set if the hw can mix flat and interpolated components
+    * in the same vec4 slot.
+    *
+    * This causes nir_opt_varyings to skip interpolation for all varyings
+    * that are convergent, and enables better compaction and inter-shader code
+    * motion for convergent varyings.
+    */
+   nir_io_mix_convergent_flat_with_interpolated = BITFIELD_BIT(5),
+
+   /**
+    * Whether src_type and dest_type of IO intrinsics are irrelevant and
+    * should be ignored by nir_opt_vectorize_io. All drivers that always treat
+    * load_input and store_output as untyped and load_interpolated_input as
+    * float##bit_size should set this.
+    */
+   nir_io_vectorizer_ignores_types = BITFIELD_BIT(6),
+
    /* Options affecting the GLSL compiler are below. */
 
    /**
@@ -3782,6 +3844,12 @@ typedef struct nir_shader_compiler_options {
 
    /** enable rules that avoid generating umin from signed integer ops */
    bool lower_umin;
+
+   /* lower fmin/fmax with signed zero preserve to fmin/fmax with
+    * no_signed_zero, for backends whose fmin/fmax implementations do not
+    * implement IEEE-754-2019 semantics for signed zero.
+    */
+   bool lower_fminmax_signed_zero;
 
    /* lower fdph to fdot4 */
    bool lower_fdph;
@@ -5903,6 +5971,7 @@ nir_build_lowered_load_helper_invocation(struct nir_builder *b);
 typedef struct nir_lower_compute_system_values_options {
    bool has_base_global_invocation_id : 1;
    bool has_base_workgroup_id : 1;
+   bool has_global_size : 1;
    bool shuffle_local_ids_for_quad_derivatives : 1;
    bool lower_local_invocation_index : 1;
    bool lower_cs_local_id_to_index : 1;
@@ -6576,6 +6645,7 @@ bool nir_opt_large_constants(nir_shader *shader,
                              glsl_type_size_align_func size_align,
                              unsigned threshold);
 
+bool nir_opt_licm(nir_shader *shader);
 bool nir_opt_loop(nir_shader *shader);
 
 bool nir_opt_loop_unroll(nir_shader *shader);
@@ -6648,7 +6718,7 @@ bool nir_opt_undef(nir_shader *shader);
 
 bool nir_lower_undef_to_zero(nir_shader *shader);
 
-bool nir_opt_uniform_atomics(nir_shader *shader);
+bool nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated);
 
 bool nir_opt_uniform_subgroup(nir_shader *shader,
                               const nir_lower_subgroups_options *);

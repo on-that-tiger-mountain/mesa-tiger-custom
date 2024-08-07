@@ -1408,9 +1408,28 @@ swap_subdword_gfx11(Builder& bld, Definition def, Operand op)
    if (def.bytes() == 2) {
       Operand def_as_op = Operand(def.physReg(), def.regClass());
       Definition op_as_def = Definition(op.physReg(), op.regClass());
-      Instruction* instr = bld.vop1(aco_opcode::v_swap_b16, def, op_as_def, op, def_as_op);
-      instr->valu().opsel[0] = op.physReg().byte();
-      instr->valu().opsel[3] = def.physReg().byte();
+      /* v_swap_b16 is not offically supported as VOP3, so it can't be used with v128-255.
+       * Tests show that VOP3 appears to work correctly, but according to AMD that should
+       * not be relied on.
+       */
+      if (def.physReg() < (256 + 128) && op.physReg() < (256 + 128)) {
+         Instruction* instr = bld.vop1(aco_opcode::v_swap_b16, def, op_as_def, op, def_as_op);
+         instr->valu().opsel[0] = op.physReg().byte();
+         instr->valu().opsel[3] = def.physReg().byte();
+      } else {
+         Instruction* instr = bld.vop3(aco_opcode::v_xor_b16, def, op, def_as_op);
+         instr->valu().opsel[0] = op.physReg().byte();
+         instr->valu().opsel[1] = def_as_op.physReg().byte();
+         instr->valu().opsel[3] = def.physReg().byte();
+         instr = bld.vop3(aco_opcode::v_xor_b16, op_as_def, op, def_as_op);
+         instr->valu().opsel[0] = op.physReg().byte();
+         instr->valu().opsel[1] = def_as_op.physReg().byte();
+         instr->valu().opsel[3] = op_as_def.physReg().byte();
+         instr = bld.vop3(aco_opcode::v_xor_b16, def, op, def_as_op);
+         instr->valu().opsel[0] = op.physReg().byte();
+         instr->valu().opsel[1] = def_as_op.physReg().byte();
+         instr->valu().opsel[3] = def.physReg().byte();
+      }
    } else {
       PhysReg op_half = op.physReg();
       op_half.reg_b &= ~1;
@@ -2956,14 +2975,18 @@ lower_to_hw_instr(Program* program)
             } else if (emit_s_barrier) {
                bld.sopp(aco_opcode::s_barrier);
             }
-         } else if (instr->opcode == aco_opcode::p_cvt_f16_f32_rtne) {
+         } else if (instr->opcode == aco_opcode::p_v_cvt_f16_f32_rtne ||
+                    instr->opcode == aco_opcode::p_s_cvt_f16_f32_rtne) {
             float_mode new_mode = block->fp_mode;
             new_mode.round16_64 = fp_round_ne;
             bool set_round = new_mode.round != block->fp_mode.round;
 
             emit_set_mode(bld, new_mode, set_round, false);
 
-            instr->opcode = aco_opcode::v_cvt_f16_f32;
+            if (instr->opcode == aco_opcode::p_v_cvt_f16_f32_rtne)
+               instr->opcode = aco_opcode::v_cvt_f16_f32;
+            else
+               instr->opcode = aco_opcode::s_cvt_f16_f32;
             ctx.instructions.emplace_back(std::move(instr));
 
             emit_set_mode(bld, block->fp_mode, set_round, false);
@@ -3006,6 +3029,8 @@ lower_to_hw_instr(Program* program)
       end_with_regs_block->kind &= ~block_kind_end_with_regs;
       exit_block->kind |= block_kind_end_with_regs;
    }
+
+   program->progress = CompilationProgress::after_lower_to_hw;
 }
 
 } // namespace aco

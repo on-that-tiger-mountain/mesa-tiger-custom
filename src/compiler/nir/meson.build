@@ -234,6 +234,7 @@ files_libnir = files(
   'nir_opt_if.c',
   'nir_opt_intrinsics.c',
   'nir_opt_large_constants.c',
+  'nir_opt_licm.c',
   'nir_opt_load_store_vectorize.c',
   'nir_opt_loop.c',
   'nir_opt_loop_unroll.c',
@@ -312,7 +313,7 @@ _libnir = static_library(
   include_directories : [inc_include, inc_src],
   c_args : [c_msvc_compat_args, no_override_init_args, no_misleading_indentation],
   gnu_symbol_visibility : 'hidden',
-  dependencies : [idep_compiler, dep_valgrind],
+  dependencies : [idep_compiler, dep_valgrind, idep_mesautil],
   build_by_default : false,
 )
 
@@ -322,7 +323,7 @@ inc_nir = include_directories('.')
 idep_nir_headers = declare_dependency(
   sources : [nir_opcodes_h, nir_builder_opcodes_h, nir_intrinsics_h, nir_intrinsics_indices_h,
              ir_expression_operation_h, builtin_types_h],
-  include_directories : [inc_nir, inc_compiler],
+  include_directories : [inc_nir, inc_compiler, inc_src, inc_include],
 )
 
 # Also link with nir

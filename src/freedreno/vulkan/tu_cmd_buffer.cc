@@ -31,8 +31,7 @@ tu_clone_trace_range(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    tu_cs_emit_wfi(cs);
    tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
-   u_trace_clone_append(begin, end, &cmd->trace, cs,
-         tu_copy_timestamp_buffer);
+   u_trace_clone_append(begin, end, &cmd->trace, cs, tu_copy_buffer);
 }
 
 static void
@@ -3842,7 +3841,7 @@ vk2tu_access(VkAccessFlags2 flags, VkPipelineStageFlags2 stages, bool image_only
                           VK_PIPELINE_STAGE_2_BLIT_BIT |
                           VK_PIPELINE_STAGE_2_RESOLVE_BIT |
                           VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT)) {
-      mask |= TU_ACCESS_UCHE_READ;
+      mask |= TU_ACCESS_UCHE_READ | TU_ACCESS_CCHE_READ;
    }
 
    return mask;

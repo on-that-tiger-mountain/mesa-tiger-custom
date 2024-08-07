@@ -139,7 +139,6 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_STRING_MARKER:
    case PIPE_CAP_CULL_DISTANCE:
    case PIPE_CAP_SHADER_ARRAY_COMPONENTS:
-   case PIPE_CAP_SHADER_CAN_READ_OUTPUTS:
    case PIPE_CAP_STREAM_OUTPUT_PAUSE_RESUME:
    case PIPE_CAP_STREAM_OUTPUT_INTERLEAVE_BUFFERS:
    case PIPE_CAP_DOUBLES:
@@ -183,8 +182,6 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_ALLOW_GLTHREAD_BUFFER_SUBDATA_OPT: /* TODO: remove if it's slow */
    case PIPE_CAP_NULL_TEXTURES:
    case PIPE_CAP_HAS_CONST_BW:
-   case PIPE_CAP_FENCE_SIGNAL:
-   case PIPE_CAP_NATIVE_FENCE_FD:
    case PIPE_CAP_CL_GL_SHARING:
       return 1;
 
@@ -309,8 +306,14 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
              PIPE_CONTEXT_PRIORITY_MEDIUM |
              PIPE_CONTEXT_PRIORITY_HIGH;
 
+   case PIPE_CAP_FENCE_SIGNAL:
+      return sscreen->info.has_syncobj;
+
    case PIPE_CAP_CONSTBUF0_FLAGS:
       return SI_RESOURCE_FLAG_32BIT;
+
+   case PIPE_CAP_NATIVE_FENCE_FD:
+      return sscreen->info.has_fence_to_handle;
 
    case PIPE_CAP_DRAW_PARAMETERS:
    case PIPE_CAP_MULTI_DRAW_INDIRECT:
@@ -757,7 +760,7 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
 
       case PIPE_VIDEO_CAP_ENC_SLICES_STRUCTURE:
          if (sscreen->info.vcn_ip_version >= VCN_2_0_0) {
-            int value = (PIPE_VIDEO_CAP_SLICE_STRUCTURE_POWER_OF_TWO_ROWS |
+            int value = (PIPE_VIDEO_CAP_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS |
                          PIPE_VIDEO_CAP_SLICE_STRUCTURE_EQUAL_ROWS |
                          PIPE_VIDEO_CAP_SLICE_STRUCTURE_EQUAL_MULTI_ROWS);
             return value;
@@ -872,6 +875,17 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          }
          else
             return 0;
+
+      case PIPE_VIDEO_CAP_ENC_RATE_CONTROL_QVBR:
+         if (sscreen->info.vcn_ip_version >= VCN_3_0_0 &&
+             sscreen->info.vcn_ip_version < VCN_4_0_0)
+            return sscreen->info.vcn_enc_minor_version >= 30;
+
+         if (sscreen->info.vcn_ip_version >= VCN_4_0_0 &&
+             sscreen->info.vcn_ip_version < VCN_5_0_0)
+            return sscreen->info.vcn_enc_minor_version >= 15;
+
+         return 0;
 
       default:
          return 0;
@@ -1132,19 +1146,26 @@ static bool si_vid_is_target_buffer_supported(struct pipe_screen *screen,
    case PIPE_VIDEO_ENTRYPOINT_ENCODE:
       /* EFC */
       if (is_format_conversion) {
+         const bool input_8bit =
+            target->buffer_format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+            target->buffer_format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+            target->buffer_format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+            target->buffer_format == PIPE_FORMAT_R8G8B8X8_UNORM;
+         const bool input_10bit =
+            target->buffer_format == PIPE_FORMAT_B10G10R10A2_UNORM ||
+            target->buffer_format == PIPE_FORMAT_B10G10R10X2_UNORM ||
+            target->buffer_format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+            target->buffer_format == PIPE_FORMAT_R10G10B10X2_UNORM;
+
          if (sscreen->info.family <= CHIP_RENOIR ||
              sscreen->debug_flags & DBG(NO_EFC))
             return false;
 
-         /* Input formats */
-         if (target->buffer_format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-             target->buffer_format != PIPE_FORMAT_R8G8B8A8_UNORM &&
-             target->buffer_format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-             target->buffer_format != PIPE_FORMAT_R8G8B8X8_UNORM)
-            return false;
-
-         /* Output formats */
-         if (format != PIPE_FORMAT_NV12)
+         if (input_8bit)
+            return format == PIPE_FORMAT_NV12;
+         else if (input_10bit)
+            return format == PIPE_FORMAT_NV12 || format == PIPE_FORMAT_P010;
+         else
             return false;
       }
 
@@ -1619,6 +1640,7 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
       (sscreen->info.family >= CHIP_GFX940 && !sscreen->info.has_graphics) ||
       /* fma32 is too slow for gpu < gfx9, so apply the option only for gpu >= gfx9 */
       (sscreen->info.gfx_level >= GFX9 && sscreen->options.force_use_fma32);
+   bool has_mediump = sscreen->info.gfx_level >= GFX8 && sscreen->options.fp16;
 
    nir_shader_compiler_options *options = sscreen->nir_options;
    ac_set_nir_options(&sscreen->info, !sscreen->use_aco, options);
@@ -1645,12 +1667,10 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
     * when execution mode is rtz instead of rtne.
     */
    options->force_f2f16_rtz = true;
-   options->io_options = nir_io_has_flexible_input_interpolation_except_flat |
-                         nir_io_prefer_scalar_fs_inputs |
-                         nir_io_glsl_lower_derefs |
-                         (sscreen->options.optimize_io ? nir_io_glsl_opt_varyings : 0);
-   options->lower_mediump_io = sscreen->info.gfx_level >= GFX8 && sscreen->options.fp16 ?
-                                  si_lower_mediump_io : NULL;
+   options->io_options |= (!has_mediump ? nir_io_mediump_is_32bit : 0) |
+                          nir_io_glsl_lower_derefs |
+                          (sscreen->options.optimize_io ? nir_io_glsl_opt_varyings : 0);
+   options->lower_mediump_io = has_mediump ? si_lower_mediump_io : NULL;
    /* HW supports indirect indexing for: | Enabled in driver
     * -------------------------------------------------------
     * TCS inputs                         | Yes

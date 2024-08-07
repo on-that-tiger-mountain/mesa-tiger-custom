@@ -16,8 +16,11 @@ args_gbm = [
 ]
 deps_gbm = []
 incs_gbm = [
-  include_directories('main'), inc_include, inc_src, inc_loader,
+  include_directories('main'), inc_include, inc_src, inc_loader, inc_gallium, inc_st_dri, inc_gallium_aux
 ]
+
+# TODO: fix includes to delete this
+incs_gbm += inc_mesa
 
 if with_dri2
   files_gbm += files('backends/dri/gbm_dri.c', 'backends/dri/gbm_driint.h')
@@ -40,7 +43,7 @@ libgbm = shared_library(
   include_directories : incs_gbm,
   c_args : [args_gbm],
   link_args : [ld_args_gc_sections],
-  link_with : libloader,
+  link_with : [libloader, libgallium_dri],
   dependencies : [deps_gbm, dep_dl, dep_thread, idep_mesautil, idep_xmlconfig],
   gnu_symbol_visibility : 'hidden',
   version : '1.0.0',

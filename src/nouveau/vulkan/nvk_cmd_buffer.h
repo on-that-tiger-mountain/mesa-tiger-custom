@@ -21,20 +21,13 @@
 
 struct nvk_buffer;
 struct nvk_cbuf;
-struct nvk_cmd_bo;
+struct nvk_cmd_mem;
 struct nvk_cmd_buffer;
 struct nvk_cmd_pool;
 struct nvk_image_view;
 struct nvk_push_descriptor_set;
 struct nvk_shader;
 struct vk_shader;
-
-struct nvk_sample_location {
-   uint8_t x_u4:4;
-   uint8_t y_u4:4;
-};
-static_assert(sizeof(struct nvk_sample_location) == 1,
-              "This struct has no holes");
 
 /** Root descriptor table.  This gets pushed to the GPU directly */
 struct nvk_root_descriptor_table {
@@ -44,7 +37,8 @@ struct nvk_root_descriptor_table {
          uint32_t base_instance;
          uint32_t draw_index;
          uint32_t view_index;
-         struct nvk_sample_location sample_locations[NVK_MAX_SAMPLES];
+         struct nak_sample_location sample_locations[NVK_MAX_SAMPLES];
+         struct nak_sample_mask sample_masks[NVK_MAX_SAMPLES];
       } draw;
       struct {
          uint32_t base_group[3];
@@ -68,7 +62,7 @@ struct nvk_root_descriptor_table {
    union nvk_buffer_descriptor dynamic_buffers[NVK_MAX_DYNAMIC_BUFFERS];
 
    /* enfore alignment to 0x100 as needed pre pascal */
-   uint8_t __padding[0x48];
+   uint8_t __padding[0x38];
 };
 
 /* helper macro for computing root descriptor byte offsets */
@@ -195,23 +189,23 @@ struct nvk_cmd_buffer {
       struct nvk_compute_state cs;
    } state;
 
-   /** List of nvk_cmd_bo
+   /** List of nvk_cmd_mem
     *
     * This list exists entirely for ownership tracking.  Everything in here
     * must also be in pushes or bo_refs if it is to be referenced by this
     * command buffer.
     */
-   struct list_head bos;
-   struct list_head gart_bos;
+   struct list_head owned_mem;
+   struct list_head owned_gart_mem;
 
-   struct nvk_cmd_bo *upload_bo;
+   struct nvk_cmd_mem *upload_mem;
    uint32_t upload_offset;
 
-   struct nvk_cmd_bo *cond_render_gart_bo;
+   struct nvk_cmd_mem *cond_render_gart_mem;
    uint32_t cond_render_gart_offset;
 
-   struct nvk_cmd_bo *push_bo;
-   uint32_t *push_bo_limit;
+   struct nvk_cmd_mem *push_mem;
+   uint32_t *push_mem_limit;
    struct nv_push push;
 
    /** Array of struct nvk_cmd_push
@@ -251,7 +245,7 @@ nvk_cmd_buffer_push(struct nvk_cmd_buffer *cmd, uint32_t dw_count)
    assert(dw_count <= NVK_CMD_BUFFER_MAX_PUSH);
 
    /* Compare to the actual limit on our push bo */
-   if (unlikely(cmd->push.end + dw_count > cmd->push_bo_limit))
+   if (unlikely(cmd->push.end + dw_count > cmd->push_mem_limit))
       nvk_cmd_buffer_new_push(cmd);
 
    cmd->push.limit = cmd->push.end + dw_count;

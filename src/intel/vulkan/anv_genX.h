@@ -242,6 +242,12 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
                               enum anv_timestamp_capture_type type,
                               void *data);
 
+void genX(cmd_capture_data)(struct anv_batch *batch,
+                            struct anv_device *device,
+                            struct anv_address dst_addr,
+                            struct anv_address src_addr,
+                            uint32_t size_B);
+
 void
 genX(batch_emit_post_3dprimitive_was)(struct anv_batch *batch,
                                       const struct anv_device *device,
@@ -354,8 +360,7 @@ genX(simple_shader_push_state_address)(struct anv_simple_shader *state,
 void
 genX(emit_simple_shader_end)(struct anv_simple_shader *state);
 
-VkResult genX(init_trtt_context_state)(struct anv_device *device,
-                                       struct anv_async_submit *submit);
+VkResult genX(init_trtt_context_state)(struct anv_async_submit *submit);
 
 void genX(write_trtt_entries)(struct anv_async_submit *submit,
                               struct anv_trtt_bind *l3l2_binds,

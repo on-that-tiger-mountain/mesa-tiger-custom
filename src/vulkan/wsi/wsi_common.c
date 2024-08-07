@@ -397,32 +397,6 @@ configure_image(const struct wsi_swapchain *chain,
    }
 }
 
-#if defined(HAVE_PTHREAD) && !defined(_WIN32)
-bool
-wsi_init_pthread_cond_monotonic(pthread_cond_t *cond)
-{
-   pthread_condattr_t condattr;
-   bool ret = false;
-
-   if (pthread_condattr_init(&condattr) != 0)
-      goto fail_attr_init;
-
-   if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0)
-      goto fail_attr_set;
-
-   if (pthread_cond_init(cond, &condattr) != 0)
-      goto fail_cond_init;
-
-   ret = true;
-
-fail_cond_init:
-fail_attr_set:
-   pthread_condattr_destroy(&condattr);
-fail_attr_init:
-   return ret;
-}
-#endif
-
 VkResult
 wsi_swapchain_init(const struct wsi_device *wsi,
                    struct wsi_swapchain *chain,
@@ -1380,9 +1354,14 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       uint32_t image_index = pPresentInfo->pImageIndices[i];
       VkResult result;
 
-      /* Update the present mode for this present and any subsequent present. */
-      if (present_mode_info && present_mode_info->pPresentModes && swapchain->set_present_mode)
+      /* Update the present mode for this present and any subsequent present.
+       * Only update the present mode when MESA_VK_WSI_PRESENT_MODE is not used.
+       * We should also turn any VkSwapchainPresentModesCreateInfoEXT into a nop,
+       * but none of the WSI backends use that currently. */
+      if (present_mode_info && present_mode_info->pPresentModes &&
+          swapchain->set_present_mode && wsi->override_present_mode == VK_PRESENT_MODE_MAX_ENUM_KHR) {
          swapchain->set_present_mode(swapchain, present_mode_info->pPresentModes[i]);
+      }
 
       if (swapchain->fences[image_index] == VK_NULL_HANDLE) {
          const VkFenceCreateInfo fence_info = {

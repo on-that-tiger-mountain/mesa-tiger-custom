@@ -46,6 +46,7 @@ if cc.get_argument_syntax() == 'msvc'
 else
   idep_getopt = null_dep
 endif
+subdir('x11')
 if with_gallium or with_gbm or with_platform_wayland
   subdir('loader')
 endif
@@ -101,17 +102,9 @@ endif
 if with_gallium_asahi or with_tools.contains('asahi')
   subdir('asahi')
 endif
-if with_gbm
-  subdir('gbm')
-else
-  inc_gbm = []
-endif
 if with_gallium
   subdir('mesa')
   subdir('gallium')
-  if with_glx == 'dri'
-     subdir('glx')
-  endif
   # This has to be here since it requires libgallium, and subdir cannot
   # contain ..
   if with_tests
@@ -120,9 +113,27 @@ if with_gallium
   if with_tests and with_shared_glapi
     subdir('mesa/state_tracker/tests')
   endif
+  if with_dri
+    if with_gallium or with_gbm or with_platform_wayland
+      subdir('loader_dri3')
+    endif
+  endif
+endif
+if with_glx == 'dri'
+  subdir('glx')
+endif
+if with_gbm
+  subdir('gbm')
+else
+  inc_gbm = []
 endif
 if with_egl
   subdir('egl')
+endif
+if with_gallium and with_gbm
+  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb
+    subdir('gallium/targets/dril')
+  endif
 endif
 
 # This must be after at least mesa, glx, and gallium, since libgl will be

@@ -26,13 +26,9 @@
 
 #include "anv_private.h"
 #include "anv_measure.h"
-#include "vk_render_pass.h"
-#include "vk_util.h"
 
-#include "common/intel_aux_map.h"
 #include "genxml/gen_macros.h"
 #include "genxml/genX_pack.h"
-#include "genxml/genX_rt_pack.h"
 #include "common/intel_genX_state_brw.h"
 
 #include "ds/intel_tracepoints.h"
@@ -381,16 +377,54 @@ cmd_buffer_emit_push_constant(struct anv_cmd_buffer *cmd_buffer,
 
 #if GFX_VER >= 12
 static void
+emit_null_push_constant_tbimr_workaround(struct anv_cmd_buffer *cmd_buffer)
+{
+   /* Pass a single-register push constant payload for the PS
+    * stage even if empty, since PS invocations with zero push
+    * constant cycles have been found to cause hangs with TBIMR
+    * enabled.  See HSDES #22020184996.
+    *
+    * XXX - Use workaround infrastructure and final workaround
+    *       when provided by hardware team.
+    */
+   const struct anv_address null_addr = {
+      .bo = cmd_buffer->device->workaround_bo,
+      .offset = 1024,
+   };
+   uint32_t *dw = anv_batch_emitn(
+      &cmd_buffer->batch, 4,
+      GENX(3DSTATE_CONSTANT_ALL),
+      .ShaderUpdateEnable = (1 << MESA_SHADER_FRAGMENT),
+      .PointerBufferMask = 1,
+      .MOCS = isl_mocs(&cmd_buffer->device->isl_dev, 0, false));
+   GENX(3DSTATE_CONSTANT_ALL_DATA_pack)(
+      &cmd_buffer->batch, dw + 2,
+      &(struct GENX(3DSTATE_CONSTANT_ALL_DATA)) {
+         .PointerToConstantBuffer = null_addr,
+         .ConstantBufferReadLength = 1,
+      });
+}
+
+static void
 cmd_buffer_emit_push_constant_all(struct anv_cmd_buffer *cmd_buffer,
                                   uint32_t shader_mask,
                                   struct anv_address *buffers,
                                   uint32_t buffer_count)
 {
    if (buffer_count == 0) {
-      anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_CONSTANT_ALL), c) {
-         c.ShaderUpdateEnable = shader_mask;
-         c.MOCS = isl_mocs(&cmd_buffer->device->isl_dev, 0, false);
+      if (cmd_buffer->device->info->needs_null_push_constant_tbimr_workaround &&
+          (shader_mask & (1 << MESA_SHADER_FRAGMENT))) {
+         emit_null_push_constant_tbimr_workaround(cmd_buffer);
+         shader_mask &= ~(1 << MESA_SHADER_FRAGMENT);
       }
+
+      if (shader_mask) {
+         anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_CONSTANT_ALL), c) {
+            c.ShaderUpdateEnable = shader_mask;
+            c.MOCS = isl_mocs(&cmd_buffer->device->isl_dev, 0, false);
+         }
+      }
+
       return;
    }
 
@@ -1983,7 +2017,8 @@ void genX(CmdDrawIndirectCount)(
                                 false /* indexed */);
    }
 
-   trace_intel_end_draw_indirect_count(&cmd_buffer->trace, maxDrawCount);
+   trace_intel_end_draw_indirect_count(&cmd_buffer->trace,
+                                       anv_address_utrace(count_address));
 }
 
 void genX(CmdDrawIndexedIndirectCount)(
@@ -2031,7 +2066,8 @@ void genX(CmdDrawIndexedIndirectCount)(
                                 true /* indexed */);
    }
 
-   trace_intel_end_draw_indexed_indirect_count(&cmd_buffer->trace, maxDrawCount);
+   trace_intel_end_draw_indexed_indirect_count(&cmd_buffer->trace,
+                                               anv_address_utrace(count_address));
 
 }
 
@@ -2307,10 +2343,11 @@ genX(CmdDrawMeshTasksIndirectCountEXT)(
    const uint32_t mocs = anv_mocs_for_address(cmd_buffer->device, &count_buffer->address);
    mi_builder_set_mocs(&b, mocs);
 
+   struct anv_address count_addr =
+      anv_address_add(count_buffer->address, countBufferOffset);
    struct mi_value max =
          prepare_for_draw_count_predicate(
-            cmd_buffer, &b,
-            anv_address_add(count_buffer->address, countBufferOffset));
+            cmd_buffer, &b, count_addr);
 
    for (uint32_t i = 0; i < maxDrawCount; i++) {
       struct anv_address draw = anv_address_add(buffer->address, offset);
@@ -2324,7 +2361,8 @@ genX(CmdDrawMeshTasksIndirectCountEXT)(
       offset += stride;
    }
 
-   trace_intel_end_draw_mesh_indirect_count(&cmd_buffer->trace, maxDrawCount);
+   trace_intel_end_draw_mesh_indirect_count(&cmd_buffer->trace,
+                                            anv_address_utrace(count_addr));
 }
 
 #endif /* GFX_VERx10 >= 125 */

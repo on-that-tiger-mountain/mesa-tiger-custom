@@ -115,12 +115,6 @@
 
 struct v3dv_instance;
 
-#ifdef USE_V3D_SIMULATOR
-#define using_v3d_simulator true
-#else
-#define using_v3d_simulator false
-#endif
-
 struct v3d_simulator_file;
 
 /* Minimum required by the Vulkan 1.1 spec */
@@ -145,7 +139,7 @@ struct v3dv_physical_device {
    dev_t primary_devid;
    dev_t render_devid;
 
-#if using_v3d_simulator
+#if USE_V3D_SIMULATOR
    uint32_t device_id;
 #endif
 
@@ -168,7 +162,9 @@ struct v3dv_physical_device {
 
    struct v3d_device_info devinfo;
 
+#if USE_V3D_SIMULATOR
    struct v3d_simulator_file *sim_file;
+#endif
 
    const struct v3d_compiler *compiler;
    uint32_t next_program_id;
@@ -2374,7 +2370,7 @@ v3dv_cmd_buffer_get_descriptor_state(struct v3dv_cmd_buffer *cmd_buffer,
       return &cmd_buffer->state.gfx.descriptor_state;
 }
 
-const nir_shader_compiler_options *v3dv_pipeline_get_nir_options(void);
+const nir_shader_compiler_options *v3dv_pipeline_get_nir_options(const struct v3d_device_info *devinfo);
 
 uint32_t v3dv_physical_device_vendor_id(const struct v3dv_physical_device *dev);
 uint32_t v3dv_physical_device_device_id(const struct v3dv_physical_device *dev);
@@ -2568,7 +2564,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(v3dv_sampler, base, VkSampler,
 static inline int
 v3dv_ioctl(int fd, unsigned long request, void *arg)
 {
-   if (using_v3d_simulator)
+   if (USE_V3D_SIMULATOR)
       return v3d_simulator_ioctl(fd, request, arg);
    else
       return drmIoctl(fd, request, arg);

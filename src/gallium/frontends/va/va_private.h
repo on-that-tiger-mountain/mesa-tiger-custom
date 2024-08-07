@@ -60,7 +60,7 @@
 #define VL_VA_DRIVER(ctx) ((vlVaDriver *)ctx->pDriverData)
 #define VL_VA_PSCREEN(ctx) (VL_VA_DRIVER(ctx)->vscreen->pscreen)
 
-#define VL_VA_MAX_IMAGE_FORMATS 17
+#define VL_VA_MAX_IMAGE_FORMATS 21
 #define VL_VA_ENC_GOP_COEFF 16
 
 #define UINT_TO_PTR(x) ((void*)(uintptr_t)(x))
@@ -84,6 +84,13 @@
 
 #define VBAQ_DISABLE (0)
 #define VBAQ_AUTO    (1)
+
+#define ENC_PACKED_HEADERS_H264 (VA_ENC_PACKED_HEADER_SEQUENCE)
+#define ENC_PACKED_HEADERS_HEVC (VA_ENC_PACKED_HEADER_SEQUENCE | \
+                                 VA_ENC_PACKED_HEADER_MISC)
+#define ENC_PACKED_HEADERS_AV1  (VA_ENC_PACKED_HEADER_SEQUENCE | \
+                                 VA_ENC_PACKED_HEADER_PICTURE  | \
+                                 VA_ENC_PACKED_HEADER_MISC)
 
 static inline enum pipe_video_chroma_format
 ChromaToPipe(int format)
@@ -134,6 +141,14 @@ VaFourccToPipeFormat(unsigned format)
       return PIPE_FORMAT_R8G8B8X8_UNORM;
    case VA_FOURCC('R','G','B','P'):
       return PIPE_FORMAT_R8_G8_B8_UNORM;
+   case VA_FOURCC('A','R','3','0'):
+      return PIPE_FORMAT_B10G10R10A2_UNORM;
+   case VA_FOURCC('A','B','3','0'):
+      return PIPE_FORMAT_R10G10B10A2_UNORM;
+   case VA_FOURCC('X','R','3','0'):
+      return PIPE_FORMAT_B10G10R10X2_UNORM;
+   case VA_FOURCC('X','B','3','0'):
+      return PIPE_FORMAT_R10G10B10X2_UNORM;
    case VA_FOURCC('Y','8','0','0'):
       return PIPE_FORMAT_Y8_400_UNORM;
    case VA_FOURCC('4','4','4','P'):
@@ -174,7 +189,15 @@ PipeFormatToVaFourcc(enum pipe_format p_format)
       return VA_FOURCC('B','G','R','X');
    case PIPE_FORMAT_R8G8B8X8_UNORM:
       return VA_FOURCC('R','G','B','X');
-    case PIPE_FORMAT_R8_G8_B8_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      return VA_FOURCC('A','R','3','0');
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+      return VA_FOURCC('A','B','3','0');
+   case PIPE_FORMAT_B10G10R10X2_UNORM:
+      return VA_FOURCC('X','R','3','0');
+   case PIPE_FORMAT_R10G10B10X2_UNORM:
+      return VA_FOURCC('X','B','3','0');
+   case PIPE_FORMAT_R8_G8_B8_UNORM:
       return VA_FOURCC('R','G','B','P');
    case PIPE_FORMAT_Y8_400_UNORM:
       return VA_FOURCC('Y','8','0','0');
@@ -386,6 +409,8 @@ typedef struct {
    int packed_header_type;
    bool packed_header_emulation_bytes;
    struct set *surfaces;
+   unsigned slice_data_offset;
+   bool have_slice_params;
 
    struct {
       void **buffers;
@@ -556,7 +581,7 @@ void vlVaHandlePictureParameterBufferVP9(vlVaDriver *drv, vlVaContext *context, 
 void vlVaHandleSliceParameterBufferVP9(vlVaContext *context, vlVaBuffer *buf);
 void vlVaDecoderVP9BitstreamHeader(vlVaContext *context, vlVaBuffer *buf);
 void vlVaHandlePictureParameterBufferAV1(vlVaDriver *drv, vlVaContext *context, vlVaBuffer *buf);
-void vlVaHandleSliceParameterBufferAV1(vlVaContext *context, vlVaBuffer *buf, unsigned num_slices, unsigned slice_offset);
+void vlVaHandleSliceParameterBufferAV1(vlVaContext *context, vlVaBuffer *buf);
 void getEncParamPresetH264(vlVaContext *context);
 void getEncParamPresetH265(vlVaContext *context);
 void getEncParamPresetAV1(vlVaContext *context);

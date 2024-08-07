@@ -84,8 +84,9 @@ v3d_screen_destroy(struct pipe_screen *pscreen)
         if (screen->ro)
                 screen->ro->destroy(screen->ro);
 
-        if (using_v3d_simulator)
-                v3d_simulator_destroy(screen->sim_file);
+#if USE_V3D_SIMULATOR
+        v3d_simulator_destroy(screen->sim_file);
+#endif
 
         v3d_compiler_free(screen->compiler);
 
@@ -140,7 +141,6 @@ v3d_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
         case PIPE_CAP_MULTI_DRAW_INDIRECT:
         case PIPE_CAP_QUADS_FOLLOW_PROVOKING_VERTEX_CONVENTION:
         case PIPE_CAP_SIGNED_VERTEX_BUFFER_OFFSET:
-        case PIPE_CAP_SHADER_CAN_READ_OUTPUTS:
         case PIPE_CAP_SHADER_PACK_HALF_FLOAT:
         case PIPE_CAP_TEXTURE_HALF_FLOAT_LINEAR:
         case PIPE_CAP_FRAMEBUFFER_NO_ATTACHMENT:
@@ -295,6 +295,9 @@ v3d_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 
         case PIPE_CAP_NATIVE_FENCE_FD:
                 return true;
+
+        case PIPE_CAP_DEPTH_CLIP_DISABLE:
+                return screen->devinfo.ver >= 71;
 
         default:
                 return u_pipe_screen_get_param_defaults(pscreen, param);
@@ -632,6 +635,14 @@ v3d_screen_is_format_supported(struct pipe_screen *pscreen,
                 return false;
         }
 
+        /* We do not support EXT_float_blend (blending with 32F formats)*/
+        if ((usage & PIPE_BIND_BLENDABLE) &&
+            (format == PIPE_FORMAT_R32G32B32A32_FLOAT ||
+             format == PIPE_FORMAT_R32G32_FLOAT ||
+             format == PIPE_FORMAT_R32_FLOAT)) {
+                return false;
+        }
+
         if ((usage & PIPE_BIND_SAMPLER_VIEW) &&
             !v3d_tex_format_supported(&screen->devinfo, format)) {
                 return false;
@@ -673,81 +684,90 @@ v3d_screen_is_format_supported(struct pipe_screen *pscreen,
         return true;
 }
 
-static const nir_shader_compiler_options v3d_nir_options = {
-        .compact_arrays = true,
-        .lower_uadd_sat = true,
-        .lower_usub_sat = true,
-        .lower_iadd_sat = true,
-        .lower_all_io_to_temps = true,
-        .lower_extract_byte = true,
-        .lower_extract_word = true,
-        .lower_insert_byte = true,
-        .lower_insert_word = true,
-        .lower_bitfield_insert = true,
-        .lower_bitfield_extract = true,
-        .lower_bitfield_reverse = true,
-        .lower_bit_count = true,
-        .lower_cs_local_id_to_index = true,
-        .lower_ffract = true,
-        .lower_fmod = true,
-        .lower_pack_unorm_2x16 = true,
-        .lower_pack_snorm_2x16 = true,
-        .lower_pack_unorm_4x8 = true,
-        .lower_pack_snorm_4x8 = true,
-        .lower_unpack_unorm_4x8 = true,
-        .lower_unpack_snorm_4x8 = true,
-        .lower_pack_half_2x16 = true,
-        .lower_unpack_half_2x16 = true,
-        .lower_pack_32_2x16 = true,
-        .lower_pack_32_2x16_split = true,
-        .lower_unpack_32_2x16_split = true,
-        .lower_fdiv = true,
-        .lower_find_lsb = true,
-        .lower_ffma16 = true,
-        .lower_ffma32 = true,
-        .lower_ffma64 = true,
-        .lower_flrp32 = true,
-        .lower_fpow = true,
-        .lower_fsat = true,
-        .lower_fsqrt = true,
-        .lower_ifind_msb = true,
-        .lower_isign = true,
-        .lower_ldexp = true,
-        .lower_hadd = true,
-        .lower_fisnormal = true,
-        .lower_mul_high = true,
-        .lower_wpos_pntc = true,
-        .lower_to_scalar = true,
-        .lower_int64_options =
-                nir_lower_bcsel64 |
-                nir_lower_conv64 |
-                nir_lower_iadd64 |
-                nir_lower_icmp64 |
-                nir_lower_imul_2x32_64 |
-                nir_lower_imul64 |
-                nir_lower_ineg64 |
-                nir_lower_logic64 |
-                nir_lower_shift64 |
-                nir_lower_ufind_msb64,
-        .lower_fquantize2f16 = true,
-        .has_fsub = true,
-        .has_isub = true,
-        .divergence_analysis_options =
-                nir_divergence_multiple_workgroup_per_compute_subgroup,
-        /* This will enable loop unrolling in the state tracker so we won't
-         * be able to selectively disable it in backend if it leads to
-         * lower thread counts or TMU spills. Choose a conservative maximum to
-         * limit register pressure impact.
-         */
-        .max_unroll_iterations = 16,
-        .force_indirect_unrolling_sampler = true,
-};
-
 static const void *
 v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
-                                enum pipe_shader_ir ir, enum pipe_shader_type shader)
+                                enum pipe_shader_ir ir,
+                                enum pipe_shader_type shader)
 {
-        return &v3d_nir_options;
+        struct v3d_screen *screen = v3d_screen(pscreen);
+        const struct v3d_device_info *devinfo = &screen->devinfo;
+
+        static bool initialized = false;
+        static nir_shader_compiler_options options = {
+                .compact_arrays = true,
+                .lower_uadd_sat = true,
+                .lower_usub_sat = true,
+                .lower_iadd_sat = true,
+                .lower_all_io_to_temps = true,
+                .lower_extract_byte = true,
+                .lower_extract_word = true,
+                .lower_insert_byte = true,
+                .lower_insert_word = true,
+                .lower_bitfield_insert = true,
+                .lower_bitfield_extract = true,
+                .lower_bitfield_reverse = true,
+                .lower_bit_count = true,
+                .lower_cs_local_id_to_index = true,
+                .lower_ffract = true,
+                .lower_fmod = true,
+                .lower_pack_unorm_2x16 = true,
+                .lower_pack_snorm_2x16 = true,
+                .lower_pack_unorm_4x8 = true,
+                .lower_pack_snorm_4x8 = true,
+                .lower_unpack_unorm_4x8 = true,
+                .lower_unpack_snorm_4x8 = true,
+                .lower_pack_half_2x16 = true,
+                .lower_unpack_half_2x16 = true,
+                .lower_pack_32_2x16 = true,
+                .lower_pack_32_2x16_split = true,
+                .lower_unpack_32_2x16_split = true,
+                .lower_fdiv = true,
+                .lower_find_lsb = true,
+                .lower_ffma16 = true,
+                .lower_ffma32 = true,
+                .lower_ffma64 = true,
+                .lower_flrp32 = true,
+                .lower_fpow = true,
+                .lower_fsqrt = true,
+                .lower_ifind_msb = true,
+                .lower_isign = true,
+                .lower_ldexp = true,
+                .lower_hadd = true,
+                .lower_fisnormal = true,
+                .lower_mul_high = true,
+                .lower_wpos_pntc = true,
+                .lower_to_scalar = true,
+                .lower_int64_options =
+                        nir_lower_bcsel64 |
+                        nir_lower_conv64 |
+                        nir_lower_iadd64 |
+                        nir_lower_icmp64 |
+                        nir_lower_imul_2x32_64 |
+                        nir_lower_imul64 |
+                        nir_lower_ineg64 |
+                        nir_lower_logic64 |
+                        nir_lower_shift64 |
+                        nir_lower_ufind_msb64,
+                .lower_fquantize2f16 = true,
+                .has_fsub = true,
+                .has_isub = true,
+                .divergence_analysis_options =
+                       nir_divergence_multiple_workgroup_per_compute_subgroup,
+                /* This will enable loop unrolling in the state tracker so we won't
+                 * be able to selectively disable it in backend if it leads to
+                 * lower thread counts or TMU spills. Choose a conservative maximum to
+                 * limit register pressure impact.
+                 */
+                .max_unroll_iterations = 16,
+                .force_indirect_unrolling_sampler = true,
+        };
+
+        if (!initialized) {
+                options.lower_fsat = devinfo->ver < 71;
+                initialized = true;
+        }
+
+        return &options;
 }
 
 static const uint64_t v3d_available_modifiers[] = {
@@ -911,7 +931,7 @@ v3d_screen_create(int fd, const struct pipe_screen_config *config,
         (void)mtx_init(&screen->bo_handles_mutex, mtx_plain);
         screen->bo_handles = util_hash_table_create_ptr_keys();
 
-#if defined(USE_V3D_SIMULATOR)
+#if USE_V3D_SIMULATOR
         screen->sim_file = v3d_simulator_init(screen->fd);
 #endif
 
