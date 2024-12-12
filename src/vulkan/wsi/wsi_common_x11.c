@@ -149,6 +149,7 @@ static bool
 wsi_x11_check_dri3_compatible(const struct wsi_device *wsi_dev,
                               xcb_connection_t *conn)
 {
+   bool match;
    xcb_screen_iterator_t screen_iter =
       xcb_setup_roots_iterator(xcb_get_setup(conn));
    xcb_screen_t *screen = screen_iter.data;
@@ -159,8 +160,12 @@ wsi_x11_check_dri3_compatible(const struct wsi_device *wsi_dev,
    int dri3_fd = wsi_dri3_open(conn, screen->root, None);
    if (dri3_fd == -1)
       return true;
-
-   bool match = wsi_device_matches_drm_fd(wsi_dev, dri3_fd);
+   #ifdef HAVE_LIBDRM
+   match = wsi_device_matches_drm_fd(wsi_dev, dri3_fd);
+   #else
+   match = true;
+   #endif
+   
 
    close(dri3_fd);
 
@@ -1236,6 +1241,8 @@ x11_get_wsi_image(struct wsi_swapchain *wsi_chain, uint32_t image_index)
 static bool
 wsi_x11_swapchain_query_dri3_modifiers_changed(struct x11_swapchain *chain);
 
+
+
 static VkResult
 x11_wait_for_explicit_sync_release_submission(struct x11_swapchain *chain,
                                               uint64_t rel_timeout_ns,
@@ -1244,14 +1251,13 @@ x11_wait_for_explicit_sync_release_submission(struct x11_swapchain *chain,
    STACK_ARRAY(struct wsi_image*, images, chain->base.image_count);
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       images[i] = &chain->images[i].base;
-
    VkResult result;
 #ifdef HAVE_LIBDRM
    result = wsi_drm_wait_for_explicit_sync_release(&chain->base,
                                                    chain->base.image_count,
                                                    images,
                                                    rel_timeout_ns,
-                                                   image_index);
+                                                  image_index);
 #else
    result = VK_ERROR_FEATURE_NOT_PRESENT;
 #endif
